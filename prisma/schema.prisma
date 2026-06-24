@@ -11,3 +11,34 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+model Recipe {
+  id            String    @id   @default(uuid())
+  title         String    
+  description   String?
+  photoUrl      String? 
+  difficulty    String
+  totalMinutes  Int
+  servings      Int
+  ingredients   Ingredient[]
+  tools         String[]
+  steps         Step[]  
+  createdAt     DateTime  @default(now())
+}
+
+model Ingredient {
+  id            String    @id   @default(uuid())
+  name          String
+  quantity      Float
+  unit          String
+  recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  recipeId      String
+}
+
+model Step {
+  id            String    @id   @default(uuid())
+  stepNumber    Int
+  instruction   String
+  recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  recipeId      String
+}
