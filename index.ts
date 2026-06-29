@@ -4,6 +4,8 @@ import type { Request, Response } from 'express'
 import cors from 'cors'
 import { PrismaClient, Prisma } from '@prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
+import authRoutes from './routes/auth.js'
+import { requireAuth } from './middleware/auth.js'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
@@ -13,6 +15,7 @@ const PORT = 3000
 
 app.use(cors())
 app.use(express.json())
+app.use('/auth', authRoutes)
 
 interface IngredientInput {
   name: string
@@ -41,25 +44,26 @@ app.get('/', (req: Request, res: Response) => {
   res.send('Recipe Book API is running')
 })
 
-app.get('/recipes', async (req: Request, res: Response) => {
+app.get('/recipes', requireAuth, async (req: Request, res: Response) => {
   const recipes = await prisma.recipe.findMany({
+    where: { userId: req.userId },
     include: { ingredients: true, steps: true },
   })
   res.json(recipes)
 })
 
-app.get('/recipes/:id', async (req: Request<{ id: string }>, res: Response) => {
+app.get('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: Response) => {
   const recipe = await prisma.recipe.findUnique({
     where: { id: req.params.id },
     include: { ingredients: true, steps: true },
   })
-  if (!recipe) {
+  if (!recipe || recipe.userId !== req.userId) {
     return res.status(404).json({ error: 'Recipe not found' })
   }
   res.json(recipe)
 })
 
-app.post('/recipes', async (req: Request<{}, {}, RecipeInput>, res: Response) => {
+app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res: Response) => {
   const { title, description, photoUrl, difficulty, totalMinutes, servings, ingredients, tools, steps } = req.body
   try {
     const newRecipe = await prisma.recipe.create({
@@ -72,7 +76,7 @@ app.post('/recipes', async (req: Request<{}, {}, RecipeInput>, res: Response) =>
         servings,
         tools,
         user: {
-          connect: { email: "test@gmail.com"}
+          connect: { id: req.userId }
         },
         ingredients: { create: ingredients },
         steps: { create: steps },
@@ -86,7 +90,7 @@ app.post('/recipes', async (req: Request<{}, {}, RecipeInput>, res: Response) =>
   }
 })
 
-app.put('/recipes/:id', async (req: Request<{ id: string }, {}, RecipeInput>, res: Response) => {
+app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, RecipeInput>, res: Response) => {
   const { title, description, photoUrl, difficulty, totalMinutes, servings, ingredients, tools, steps } = req.body
   try {
     const updatedRecipe = await prisma.recipe.update({
@@ -120,7 +124,7 @@ app.put('/recipes/:id', async (req: Request<{ id: string }, {}, RecipeInput>, re
   }
 })
 
-app.delete('/recipes/:id', async (req: Request<{ id: string }>, res: Response) => {
+app.delete('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: Response) => {
   try {
     await prisma.recipe.delete({ where: { id: req.params.id } })
     res.status(204).send()
