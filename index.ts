@@ -71,6 +71,9 @@ app.post('/recipes', async (req: Request<{}, {}, RecipeInput>, res: Response) =>
         totalMinutes,
         servings,
         tools,
+        user: {
+          connect: { email: "test@gmail.com"}
+        },
         ingredients: { create: ingredients },
         steps: { create: steps },
       },

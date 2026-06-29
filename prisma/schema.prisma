@@ -23,6 +23,8 @@ model Recipe {
   tools         String[]
   steps         Step[]  
   createdAt     DateTime  @default(now())
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId        String
 }
 
 model Ingredient {
@@ -41,3 +43,13 @@ model Step {
   recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
   recipeId      String
 }
+
+model User {
+  id        String    @id @default(uuid())
+  email     String    @unique
+  password  String    
+  recipes   Recipe[]
+  createdAt DateTime  @default(now())
+}
+
+

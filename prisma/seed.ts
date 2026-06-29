@@ -15,6 +15,9 @@ async function main() {
         totalMinutes: 30,
         servings: 4,
         tools: ["large pot", "frying pan", "whisk"],
+        user: {
+            connect: { email: "test@gmail.com"}
+        },
         ingredients: {
             create: [
             { name: "spaghetti", quantity: 400, unit: "g" },
@@ -42,6 +45,9 @@ async function main() {
         totalMinutes: 10,
         servings: 1,
         tools: ["toaster", "fork"],
+        user: {
+            connect: { email: "test@gmail.com"}
+        },
         ingredients: {
             create: [
             { name: "bread", quantity: 2, unit: "whole" },
