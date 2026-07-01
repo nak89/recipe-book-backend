@@ -5,6 +5,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
 
+//initalise new tables for datas 
 async function main() {
     await prisma.recipe.create({
     data: {

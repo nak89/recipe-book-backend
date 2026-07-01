@@ -3,6 +3,8 @@
 
 // Get a free hosted Postgres database in seconds: `npx create-db`
 
+//Prisma is an ORM (object relational mapping) helps to create relational database easier
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,6 +12,11 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+//Defining the recipe table
+//@default means it autp generates upon creation and uuid is just 
+//to generate a unique code
+//@id means primary key @relation means foreign key 
 
 model Recipe {
   id            String    @id   @default(uuid())

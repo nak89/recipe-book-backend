@@ -1,3 +1,8 @@
+//This is a middleware, whenever the routes hits an endpoint we have to do requireAuth to check for authorization before 
+//allowing to proceed to any other endpoint
+//Doing this saves time instead of writing a auth check for every endpoint
+//We can just put this in front of each of them
+
 import jwt from 'jsonwebtoken'
 import type { Request, Response, NextFunction } from 'express'
 

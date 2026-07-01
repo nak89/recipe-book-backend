@@ -1,3 +1,5 @@
+//Main backend file handles all the REST API logic 
+
 import 'dotenv/config'
 import express from 'express'
 import type { Request, Response } from 'express'
@@ -15,7 +17,7 @@ const PORT = 3000
 
 app.use(cors())
 app.use(express.json())
-app.use('/auth', authRoutes)
+app.use('/auth', authRoutes) //using the auth routes before allowing user to hit endpoint
 
 interface IngredientInput {
   name: string
@@ -39,10 +41,11 @@ interface RecipeInput {
   ingredients: IngredientInput[]
   steps: StepInput[]
 }
-
+//home endpoint
 app.get('/', (req: Request, res: Response) => {
   res.send('Recipe Book API is running')
 })
+
 
 app.get('/recipes', requireAuth, async (req: Request, res: Response) => {
   const recipes = await prisma.recipe.findMany({
@@ -64,8 +67,10 @@ app.get('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
 })
 
 app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res: Response) => {
+  //destructuring the body
   const { title, description, photoUrl, difficulty, totalMinutes, servings, ingredients, tools, steps } = req.body
   try {
+    //create new recipe
     const newRecipe = await prisma.recipe.create({
       data: {
         title,
