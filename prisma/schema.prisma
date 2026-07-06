@@ -26,12 +26,20 @@ model Recipe {
   difficulty    String
   totalMinutes  Int
   servings      Int
+  cuisine       String?
+  course        String?
+  isFavourite   Boolean   @default(false)
+  calories      Float?
+  protein       Float?
+  carbs         Float?
+  fat           Float?
   ingredients   Ingredient[]
   tools         String[]
   steps         Step[]  
   createdAt     DateTime  @default(now())
   user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId        String
+  
 }
 
 model Ingredient {

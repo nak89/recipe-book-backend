@@ -37,6 +37,13 @@ interface RecipeInput {
   difficulty: string
   totalMinutes: number
   servings: number
+  cuisine?: string 
+  course?: string 
+  isFavourite?: boolean 
+  calories?: number
+  protein?: number
+  carbs?: number
+  fat?: number
   tools: string[]
   ingredients: IngredientInput[]
   steps: StepInput[]
@@ -68,7 +75,22 @@ app.get('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
 
 app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res: Response) => {
   //destructuring the body
-  const { title, description, photoUrl, difficulty, totalMinutes, servings, ingredients, tools, steps } = req.body
+  const {
+  title, description, photoUrl, difficulty, totalMinutes, servings,
+  cuisine, course, isFavourite, calories, protein, carbs, fat,
+  ingredients, tools, steps
+  } = req.body
+  const existing = await prisma.recipe.findFirst({
+    where: {
+      userId: req.userId, 
+      title: {
+        equals: title.trim(),
+        mode: 'insensitive',
+      },
+    },
+  })
+  if (existing) return res.status(409).json({error: `You already have a recipe titled "${existing.title}"`})
+    
   try {
     //create new recipe
     const newRecipe = await prisma.recipe.create({
@@ -79,10 +101,15 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
         difficulty,
         totalMinutes,
         servings,
+        cuisine,
+        course,
+        isFavourite,
+        calories,
+        protein,
+        carbs,
+        fat,
         tools,
-        user: {
-          connect: { id: req.userId }
-        },
+        user: { connect: { id: req.userId } },  // POST only
         ingredients: { create: ingredients },
         steps: { create: steps },
       },
@@ -96,7 +123,11 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
 })
 
 app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, RecipeInput>, res: Response) => {
-  const { title, description, photoUrl, difficulty, totalMinutes, servings, ingredients, tools, steps } = req.body
+  const {
+  title, description, photoUrl, difficulty, totalMinutes, servings,
+  cuisine, course, isFavourite, calories, protein, carbs, fat,
+  ingredients, tools, steps
+} = req.body
   try {
     const updatedRecipe = await prisma.recipe.update({
       where: { id: req.params.id },
@@ -107,15 +138,17 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, Rec
         difficulty,
         totalMinutes,
         servings,
+        cuisine,
+        course,
+        isFavourite,
+        calories,
+        protein,
+        carbs,
+        fat,
         tools,
-        ingredients: {
-          deleteMany: {},
-          create: ingredients,
-        },
-        steps: {
-          deleteMany: {},
-          create: steps,
-        },
+        user: { connect: { id: req.userId } },  // POST only
+        ingredients: { create: ingredients },
+        steps: { create: steps },
       },
       include: { ingredients: true, steps: true },
     })
@@ -139,6 +172,24 @@ app.delete('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res
     }
     console.error(err)
     res.status(500).json({ error: 'Failed to delete recipe' })
+  }
+})
+
+app.patch('/recipes/:id/favourite', requireAuth, async (req: Request<{ id: string }>, res: Response) => {
+  const { isFavourite } = req.body
+  try {
+    const updatedRecipe = await prisma.recipe.update({
+      where: { id: req.params.id, userId: req.userId },
+      data: { isFavourite },
+      include: { ingredients: true, steps: true },
+    })
+    res.json(updatedRecipe)
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+      return res.status(404).json({ error: 'Recipe not found' })
+    }
+    console.error(err)
+    res.status(500).json({ error: 'Failed to update favourite' })
   }
 })
 

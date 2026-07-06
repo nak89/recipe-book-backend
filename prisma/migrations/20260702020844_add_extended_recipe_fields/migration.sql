@@ -1,0 +1,8 @@
+-- AlterTable
+ALTER TABLE "Recipe" ADD COLUMN     "calories" DOUBLE PRECISION,
+ADD COLUMN     "carbs" DOUBLE PRECISION,
+ADD COLUMN     "course" TEXT,
+ADD COLUMN     "cuisine" TEXT,
+ADD COLUMN     "fat" DOUBLE PRECISION,
+ADD COLUMN     "isFavourite" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN     "protein" DOUBLE PRECISION;
