@@ -125,34 +125,42 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
 
 app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, RecipeInput>, res: Response) => {
   const {
-  title, description, photoUrl, difficulty, totalMinutes, servings,
-  cuisine, course, isFavourite, calories, protein, carbs, fat,
-  ingredients, tools, steps
-} = req.body
+    title, description, photoUrl, difficulty, totalMinutes, servings,
+    cuisine, course, isFavourite, calories, protein, carbs, fat,
+    ingredients, tools, steps
+  } = req.body
+
   try {
-    const updatedRecipe = await prisma.recipe.update({
-      where: { id: req.params.id },
-      data: {
-        title,
-        description,
-        photoUrl,
-        difficulty,
-        totalMinutes,
-        servings,
-        cuisine,
-        course,
-        isFavourite,
-        calories,
-        protein,
-        carbs,
-        fat,
-        tools,
-        user: { connect: { id: req.userId } },  // POST only
-        ingredients: { create: ingredients },
-        steps: { create: steps },
-      },
-      include: { ingredients: true, steps: true },
+    const updatedRecipe = await prisma.$transaction(async (tx) => {
+      // Step 1: delete existing ingredients and steps
+      await tx.ingredient.deleteMany({ where: { recipeId: req.params.id } })
+      await tx.step.deleteMany({ where: { recipeId: req.params.id } })
+
+      // Step 2: update the recipe fields and create fresh ingredients/steps
+      return tx.recipe.update({
+        where: { id: req.params.id, userId: req.userId },
+        data: {
+          title,
+          description,
+          photoUrl,
+          difficulty,
+          totalMinutes,
+          servings,
+          cuisine,
+          course,
+          isFavourite,
+          calories,
+          protein,
+          carbs,
+          fat,
+          tools,
+          ingredients: { create: ingredients },
+          steps: { create: steps },
+        },
+        include: { ingredients: true, steps: true },
+      })
     })
+
     res.json(updatedRecipe)
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
