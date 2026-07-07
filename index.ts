@@ -8,6 +8,7 @@ import { PrismaClient, Prisma } from '@prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 import authRoutes from './routes/auth.js'
 import { requireAuth } from './middleware/auth.js'
+import uploadRoutes from './routes/upload.js'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
@@ -90,7 +91,7 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
     },
   })
   if (existing) return res.status(409).json({error: `You already have a recipe titled "${existing.title}"`})
-    
+
   try {
     //create new recipe
     const newRecipe = await prisma.recipe.create({
@@ -192,6 +193,8 @@ app.patch('/recipes/:id/favourite', requireAuth, async (req: Request<{ id: strin
     res.status(500).json({ error: 'Failed to update favourite' })
   }
 })
+
+app.use('/upload', uploadRoutes)
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`)
