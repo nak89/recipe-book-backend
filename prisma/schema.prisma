@@ -14,20 +14,24 @@ datasource db {
 }
 
 //Defining the recipe table
-//@default means it autp generates upon creation and uuid is just 
+//@default means it autp generates upon creation and uuid is just
 //to generate a unique code
-//@id means primary key @relation means foreign key 
+//@id means primary key @relation means foreign key
 
+//userId references a Supabase auth.users id. That table lives outside this
+//Prisma schema (Supabase Auth owns it), so there's no Prisma-level relation
+//or cascade here — just a plain scoping column.
 model Recipe {
   id            String    @id   @default(uuid())
-  title         String    
+  title         String
   description   String?
-  photoUrl      String? 
+  photoUrl      String?
   difficulty    String
   totalMinutes  Int
   servings      Int
   cuisine       String?
-  course        String?
+  //Breakfast | Lunch | Dinner | Snack — the mobile dashboard's filter chips.
+  mealtime      String?
   isFavourite   Boolean   @default(false)
   calories      Float?
   protein       Float?
@@ -35,11 +39,10 @@ model Recipe {
   fat           Float?
   ingredients   Ingredient[]
   tools         String[]
-  steps         Step[]  
+  steps         Step[]
   createdAt     DateTime  @default(now())
-  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   userId        String
-  
+
 }
 
 model Ingredient {
@@ -58,13 +61,4 @@ model Step {
   recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
   recipeId      String
 }
-
-model User {
-  id        String    @id @default(uuid())
-  email     String    @unique
-  password  String    
-  recipes   Recipe[]
-  createdAt DateTime  @default(now())
-}
-
 

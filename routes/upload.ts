@@ -1,13 +1,14 @@
-//upload endpoint using cloudinary and multer as middleware
+//upload endpoint using Supabase Storage and multer as middleware
 
 import express from 'express'
 import type { Request, Response } from 'express'
 import multer from 'multer'
-import cloudinary from '../cloudinary'
-import { requireAuth } from '../middleware/auth'
+import { randomUUID } from 'crypto'
+import { supabase } from '../supabase.js'
+import { requireAuth } from '../middleware/auth.js'
 
 const router = express.Router()
-// stores the uploaded file in memory as buffer 
+// stores the uploaded file in memory as buffer
 const storage = multer.memoryStorage()
 const upload = multer ({
     storage,
@@ -20,31 +21,29 @@ const upload = multer ({
         }
     },
 })
+
+const BUCKET = process.env.SUPABASE_STORAGE_BUCKET ?? 'recipe-photos'
+
 //upload.single('photo') tells multer to expect 1 file under field name photo
 router.post('/', requireAuth, upload.single('photo'), async(req: Request, res: Response) => {
     if(!req.file) {
         return res.status(400).json({ error: 'No file uploaded' })
     }
     try {
-        const result = await new Promise<{ secure_url: string }>((resolve, reject) => {
-            cloudinary.uploader.upload_stream( //Cloudinary way of uploading from buffer
-                {
-                    folder: 'recipe-book',
-                    transformation: [{ width: 800, height: 600, crop: 'fill' }],
-                },
-                (error, result) => {
-                    if(error || !result) reject(error)
-                    else resolve(result)
-                }
-            ).end(req.file!.buffer)
-        })
+        const extension = req.file.originalname.split('.').pop() ?? 'jpg'
+        const path = `${req.userId}/${randomUUID()}.${extension}`
 
-        res.json({ url: result.secure_url })
+        const { error: uploadError } = await supabase.storage
+            .from(BUCKET)
+            .upload(path, req.file.buffer, { contentType: req.file.mimetype })
+        if (uploadError) throw uploadError
+
+        const { data } = supabase.storage.from(BUCKET).getPublicUrl(path)
+        res.json({ url: data.publicUrl })
     } catch (err) {
         console.error(err)
-        res.status(500).json({ error: 'Failed to uplaod image' })
+        res.status(500).json({ error: 'Failed to upload image' })
     }
 })
 
 export default router
-

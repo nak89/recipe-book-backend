@@ -39,7 +39,7 @@ interface RecipeInput {
   totalMinutes: number
   servings: number
   cuisine?: string 
-  course?: string 
+  mealtime?: string 
   isFavourite?: boolean 
   calories?: number
   protein?: number
@@ -49,6 +49,13 @@ interface RecipeInput {
   ingredients: IngredientInput[]
   steps: StepInput[]
 }
+// Every recipe must carry a photo — the mobile app's card and carousel layouts
+// are photo-first and have no designed state for a missing image. The form
+// blocks first; this is the backstop for anything that bypasses it.
+function missingPhotoUrl(body: RecipeInput) {
+  return typeof body.photoUrl !== 'string' || body.photoUrl.trim() === ''
+}
+
 //home endpoint
 app.get('/', (req: Request, res: Response) => {
   res.send('Recipe Book API is running')
@@ -78,9 +85,15 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
   //destructuring the body
   const {
   title, description, photoUrl, difficulty, totalMinutes, servings,
-  cuisine, course, isFavourite, calories, protein, carbs, fat,
+  cuisine, mealtime, isFavourite, calories, protein, carbs, fat,
   ingredients, tools, steps
   } = req.body
+  if (typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ error: 'Title is required' })
+  }
+  if (missingPhotoUrl(req.body)) {
+    return res.status(400).json({ error: 'A photo is required' })
+  }
   const existing = await prisma.recipe.findFirst({
     where: {
       userId: req.userId, 
@@ -103,14 +116,14 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
         totalMinutes,
         servings,
         cuisine,
-        course,
+        mealtime,
         isFavourite,
         calories,
         protein,
         carbs,
         fat,
         tools,
-        user: { connect: { id: req.userId } },  // POST only
+        userId: req.userId as string,
         ingredients: { create: ingredients },
         steps: { create: steps },
       },
@@ -126,9 +139,16 @@ app.post('/recipes', requireAuth, async (req: Request<{}, {}, RecipeInput>, res:
 app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, RecipeInput>, res: Response) => {
   const {
     title, description, photoUrl, difficulty, totalMinutes, servings,
-    cuisine, course, isFavourite, calories, protein, carbs, fat,
+    cuisine, mealtime, isFavourite, calories, protein, carbs, fat,
     ingredients, tools, steps
   } = req.body
+
+  if (typeof title !== 'string' || !title.trim()) {
+    return res.status(400).json({ error: 'Title is required' })
+  }
+  if (missingPhotoUrl(req.body)) {
+    return res.status(400).json({ error: 'A photo is required' })
+  }
 
   try {
     const updatedRecipe = await prisma.$transaction(async (tx) => {
@@ -147,7 +167,7 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, Rec
           totalMinutes,
           servings,
           cuisine,
-          course,
+          mealtime,
           isFavourite,
           calories,
           protein,
@@ -173,7 +193,7 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }, {}, Rec
 
 app.delete('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: Response) => {
   try {
-    await prisma.recipe.delete({ where: { id: req.params.id } })
+    await prisma.recipe.delete({ where: { id: req.params.id, userId: req.userId } })
     res.status(204).send()
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {

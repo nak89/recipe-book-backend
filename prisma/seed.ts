@@ -5,7 +5,15 @@ import { PrismaPg } from '@prisma/adapter-pg'
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
 
-//initalise new tables for datas 
+// Recipes are scoped to a Supabase auth user id. Sign up a test account first,
+// grab its id from the Supabase dashboard (Authentication -> Users), and set
+// SEED_USER_ID before running this script.
+if (!process.env.SEED_USER_ID) {
+    throw new Error('Set SEED_USER_ID to a real Supabase auth user id before seeding')
+}
+const seedUserId: string = process.env.SEED_USER_ID
+
+//initalise new tables for datas
 async function main() {
     await prisma.recipe.create({
     data: {
@@ -16,9 +24,7 @@ async function main() {
         totalMinutes: 30,
         servings: 4,
         tools: ["large pot", "frying pan", "whisk"],
-        user: {
-            connect: { email: "test@gmail.com"}
-        },
+        userId: seedUserId,
         ingredients: {
             create: [
             { name: "spaghetti", quantity: 400, unit: "g" },
@@ -46,9 +52,7 @@ async function main() {
         totalMinutes: 10,
         servings: 1,
         tools: ["toaster", "fork"],
-        user: {
-            connect: { email: "test@gmail.com"}
-        },
+        userId: seedUserId,
         ingredients: {
             create: [
             { name: "bread", quantity: 2, unit: "whole" },
@@ -77,3 +81,5 @@ main()
     .finally(async () => {
         await prisma.$disconnect()
     })
+
+
