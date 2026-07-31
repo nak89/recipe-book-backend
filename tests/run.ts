@@ -165,6 +165,79 @@ async function main() {
     })
   }
 
+  // Optional fields still have ceilings, and the whole recipe has one too.
+  await test('POST /recipes rejects a description over 1000 words', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ description: 'word '.repeat(1001).trim() })),
+    })
+    expectStatus(res, 400)
+    expect(
+      JSON.stringify(res.body).toLowerCase().includes('word'),
+      `expected the word limit to be named, got "${res.body?.error}"`
+    )
+    return `400 ${res.body.error}`
+  })
+
+  await test('POST /recipes accepts a description of exactly 1000 words', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ description: 'word '.repeat(1000).trim() })),
+    })
+    expectStatus(res, 201, 'the limit itself must be allowed, not just under it')
+    return 'boundary is inclusive'
+  })
+
+  await test('POST /recipes rejects a recipe over the 60KB size cap', async () => {
+    // Every field inside its own limit; only the total is too big.
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          steps: Array.from({ length: 40 }, (_, i) => ({ stepNumber: i + 1, instruction: 'x'.repeat(1900) })),
+        })
+      ),
+    })
+    expectStatus(res, 400)
+    expect(
+      JSON.stringify(res.body).toLowerCase().includes('kb'),
+      `expected the size limit to be named, got "${res.body?.error}"`
+    )
+    return `400 ${res.body.error}`
+  })
+
+  await test('PUT /recipes/:id is capped the same way', async () => {
+    const seed = await api('/recipes', { method: 'POST', token: alice.token, body: JSON.stringify(validRecipe()) })
+    expectStatus(seed, 201)
+    const res = await api(`/recipes/${seed.body.id}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: seed.body.title,
+          steps: Array.from({ length: 40 }, (_, i) => ({ stepNumber: i + 1, instruction: 'x'.repeat(1900) })),
+        })
+      ),
+    })
+    expectStatus(res, 400)
+    return `400 ${res.body.error}`
+  })
+
+  await test('a body over express.json’s 100kb limit → 413 JSON, not a 500', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      headers: { 'Content-Type': 'application/json' },
+      rawBody: JSON.stringify(validRecipe({ description: 'x'.repeat(200_000) })),
+    })
+    expectStatus(res, 413)
+    expect(res.body?.error !== undefined, `expected JSON, got: ${res.raw.slice(0, 60)}`)
+    return `413 ${res.body.error}`
+  })
+
   await test('POST /recipes rejects malformed JSON with JSON (not an HTML error page)', async () => {
     const res = await api('/recipes', {
       method: 'POST',
@@ -278,6 +351,64 @@ async function main() {
     return 'replaced 2 ingredients with 1'
   })
 
+  await test('PUT keeping the recipe’s own title is not a duplicate', async () => {
+    const res = await api(`/recipes/${recipeId}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ title, servings: 4, ingredients: [{ name: 'pasta', quantity: 400, unit: 'g' }], steps: [{ stepNumber: 1, instruction: 'Boil' }] })),
+    })
+    expectStatus(res, 200, 'a recipe must not collide with itself on save')
+    return 'saved without renaming'
+  })
+
+  let secondId = ''
+  const secondTitle = `QA Focaccia ${randomUUID().slice(0, 6)}`
+
+  await test('POST creates a second recipe (for the rename test)', async () => {
+    const res = await api('/recipes', { method: 'POST', token: alice.token, body: JSON.stringify(validRecipe({ title: secondTitle })) })
+    expectStatus(res, 201)
+    secondId = res.body.id
+  })
+
+  await test('PUT renaming onto another of your recipes → 409', async () => {
+    const res = await api(`/recipes/${secondId}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ title })),
+    })
+    expectStatus(res, 409, 'rename collided but was allowed through')
+    return `409 ${res.body?.error}`
+  })
+
+  await test('PUT renaming onto a title differing only in case → 409', async () => {
+    const res = await api(`/recipes/${secondId}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ title: title.toLowerCase() })),
+    })
+    expectStatus(res, 409)
+  })
+
+  await test('…and the rejected rename changed nothing', async () => {
+    const res = await api(`/recipes/${secondId}`, { token: alice.token })
+    expectStatus(res, 200)
+    expect(res.body.title === secondTitle, `title became "${res.body.title}"`)
+    expect(res.body.ingredients.length === 2, `ingredients were replaced: ${res.body.ingredients.length}`)
+    return 'title and rows untouched — the 409 came before the write'
+  })
+
+  await test('a different user may rename onto that title', async () => {
+    const bobRecipe = await api('/recipes', { method: 'POST', token: bob.token, body: JSON.stringify(validRecipe({ title: `QA Bob ${randomUUID().slice(0, 6)}` })) })
+    expectStatus(bobRecipe, 201)
+    const res = await api(`/recipes/${bobRecipe.body.id}`, {
+      method: 'PUT',
+      token: bob.token,
+      body: JSON.stringify(validRecipe({ title: secondTitle })),
+    })
+    expectStatus(res, 200, 'title uniqueness must stay per-user')
+    return 'per-user, as intended'
+  })
+
   await test('PATCH /recipes/:id/favourite sets the flag', async () => {
     const res = await api(`/recipes/${recipeId}/favourite`, {
       method: 'PATCH',
@@ -303,8 +434,103 @@ async function main() {
     expectStatus(res, 400)
   })
 
+  // ── Nutrition ─────────────────────────────────────────────────────────────
+  group('5. Nutrition — per-serving values, and clearing them')
+
+  let nutritionId = ''
+
+  await test('POST stores all four nutrition values', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ calories: 520, protein: 31.5, carbs: 48, fat: 22 })),
+    })
+    expectStatus(res, 201)
+    nutritionId = res.body.id
+    expect(
+      res.body.calories === 520 && res.body.protein === 31.5 && res.body.carbs === 48 && res.body.fat === 22,
+      `stored ${JSON.stringify([res.body.calories, res.body.protein, res.body.carbs, res.body.fat])}`
+    )
+    return '520 kcal, 31.5 g protein — decimals survive'
+  })
+
+  await test('a recipe saved without nutrition reads back as null, not 0', async () => {
+    const res = await api('/recipes', { method: 'POST', token: alice.token, body: JSON.stringify(validRecipe()) })
+    expectStatus(res, 201)
+    const values = [res.body.calories, res.body.protein, res.body.carbs, res.body.fat]
+    expect(values.every((v) => v === null), `expected four nulls, got ${JSON.stringify(values)}`)
+    return 'null means "not known", which is not the claim 0 makes'
+  })
+
+  await test('PUT with explicit nulls actually clears a saved value', async () => {
+    const res = await api(`/recipes/${nutritionId}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ calories: null, protein: null, carbs: null, fat: null })),
+    })
+    expectStatus(res, 200)
+    // Re-read rather than trusting the echo — what got written is the point.
+    const after = await api(`/recipes/${nutritionId}`, { token: alice.token })
+    const values = [after.body.calories, after.body.protein, after.body.carbs, after.body.fat]
+    expect(values.every((v) => v === null), `still stored ${JSON.stringify(values)}`)
+  })
+
+  await test('PUT that omits nutrition leaves the stored values alone (undefined is not null)', async () => {
+    const set = await api(`/recipes/${nutritionId}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ calories: 400, protein: 10, carbs: 20, fat: 5 })),
+    })
+    expectStatus(set, 200)
+    const omitted = await api(`/recipes/${nutritionId}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(validRecipe()),
+    })
+    expectStatus(omitted, 200)
+    expect(omitted.body.calories === 400, `omission cleared it (got ${omitted.body.calories})`)
+    return 'omitting preserves — which is why the app always sends an explicit null'
+  })
+
+  await test('calories above the 10,000 per-serving cap is rejected', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ calories: 10_001 })),
+    })
+    expectStatus(res, 400)
+    return `400 ${res.body.error}`
+  })
+
+  await test('a macro above the 1,000 g cap is rejected', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ protein: 1001 })),
+    })
+    expectStatus(res, 400)
+  })
+
+  await test('a negative nutrition value is rejected', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ fat: -1 })),
+    })
+    expectStatus(res, 400)
+  })
+
+  await test('a nutrition value sent as a string is rejected', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ carbs: '48' })),
+    })
+    expectStatus(res, 400)
+  })
+
   // ── Cross-user isolation ──────────────────────────────────────────────────
-  group('5. Cross-user isolation — bob attacking alice')
+  group('6. Cross-user isolation — bob attacking alice')
 
   await test("bob cannot read alice's recipe", async () => {
     const res = await api(`/recipes/${recipeId}`, { token: bob.token })
@@ -354,7 +580,7 @@ async function main() {
   })
 
   // ── Not-found and routing edge cases ──────────────────────────────────────
-  group('6. Edge cases and error shape')
+  group('7. Edge cases and error shape')
 
   await test('GET a well-formed but nonexistent id → 404', async () => {
     const res = await api(`/recipes/${randomUUID()}`, { token: alice.token })
@@ -385,7 +611,7 @@ async function main() {
   })
 
   // ── Upload ────────────────────────────────────────────────────────────────
-  group('7. Photo upload')
+  group('8. Photo upload')
 
   await test('upload without a token → 401', async () => {
     const res = await api('/upload', { method: 'POST', rawBody: form(PNG_1X1, 'x.png', 'image/png') })
@@ -460,7 +686,7 @@ async function main() {
   })
 
   // ── Headers ───────────────────────────────────────────────────────────────
-  group('8. CORS and security headers')
+  group('9. CORS and security headers')
 
   await test('a disallowed browser origin gets no CORS header back', async () => {
     const res = await api('/', { headers: { Origin: 'https://evil.example' } })
@@ -484,7 +710,7 @@ async function main() {
   })
 
   // ── Rate limiting (runs last: it deliberately exhausts the buckets) ───────
-  group('9. Rate limiting')
+  group('10. Rate limiting')
 
   await test('repeated failed logins are throttled (limit 10 / 15 min)', async () => {
     let throttledAt = 0

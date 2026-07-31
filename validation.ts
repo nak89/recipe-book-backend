@@ -50,9 +50,40 @@ const stepSchema = z.object({
   instruction: z.string().trim().min(1, 'Step instruction is required').max(2000),
 })
 
+// Nutrition is *per serving*, so these bounds are what one plate can plausibly
+// hold — not what a whole tray could total. 100_000 was the old bound and it
+// would never have caught a realistic slip.
+export const MAX_CALORIES = 10_000
+export const MAX_MACRO_GRAMS = 1_000
+
+// Nullable as well as optional, and the distinction matters: Prisma reads an
+// `undefined` field in an update as "leave this column alone", so omitting a
+// value the user has just cleared silently puts the old number back. Only an
+// explicit null empties the column, and the app sends one.
+const caloriesSchema = z.number().finite().min(0).max(MAX_CALORIES).nullable().optional()
+const macroSchema = z.number().finite().min(0).max(MAX_MACRO_GRAMS).nullable().optional()
+
+export const MAX_DESCRIPTION_WORDS = 1000
+/** Hard ceiling on one recipe's JSON body. See the note on `withSizeLimit`. */
+export const MAX_RECIPE_BYTES = 60 * 1024
+
+function countWords(value: string): number {
+  const trimmed = value.trim()
+  return trimmed ? trimmed.split(/\s+/).length : 0
+}
+
+// Two caps, deliberately. Words is the rule a person understands and the one
+// the app reports; characters is the backstop, because 1000 "words" can still
+// be 1000 × 8000 characters if none of them contain a space.
+const descriptionSchema = z
+  .string()
+  .trim()
+  .max(8000)
+  .refine((v) => countWords(v) <= MAX_DESCRIPTION_WORDS, `Description must be ${MAX_DESCRIPTION_WORDS} words or fewer`)
+
 const recipeBaseSchema = z.object({
   title: z.string().trim().min(1, 'Title is required').max(200),
-  description: z.string().trim().max(5000).optional(),
+  description: descriptionSchema.optional(),
   photoUrl: photoUrlSchema,
   difficulty: z.enum(['Beginner', 'Intermediate', 'Advanced']),
   totalMinutes: z.number().int().min(1).max(100_000),
@@ -60,10 +91,10 @@ const recipeBaseSchema = z.object({
   cuisine: z.string().trim().max(100).optional(),
   mealtime: z.enum(['Breakfast', 'Lunch', 'Dinner', 'Snack']).optional(),
   isFavourite: z.boolean().optional(),
-  calories: z.number().finite().min(0).max(100_000).optional(),
-  protein: z.number().finite().min(0).max(100_000).optional(),
-  carbs: z.number().finite().min(0).max(100_000).optional(),
-  fat: z.number().finite().min(0).max(100_000).optional(),
+  calories: caloriesSchema,
+  protein: macroSchema,
+  carbs: macroSchema,
+  fat: macroSchema,
   tools: z.array(z.string().trim().min(1).max(100)).max(50),
   // Required and non-empty. PUT replaces these lists wholesale, so an omitted
   // array would otherwise delete every row and create none — a silent wipe
@@ -72,8 +103,28 @@ const recipeBaseSchema = z.object({
   steps: z.array(stepSchema).min(1, 'At least one step is required').max(100),
 })
 
-export const createRecipeSchema = recipeBaseSchema
-export const updateRecipeSchema = recipeBaseSchema
+/**
+ * A ceiling on the whole recipe, not just each field.
+ *
+ * The per-field caps multiply: 100 steps × 2000 characters plus 100 ingredients
+ * is already over 200KB of legitimate-looking rows, and every one of those is a
+ * database row this request gets to write. One cap on the total is the only
+ * thing that bounds it.
+ *
+ * This runs on the *parsed* value, so it measures what we'd actually store —
+ * not the padding an attacker adds in unknown keys, which zod has stripped by
+ * then. `express.json`'s 100kb limit sits above it and catches bodies too big
+ * to be worth parsing at all; this one produces the message a user can act on.
+ */
+function withSizeLimit<T extends z.ZodType>(schema: T) {
+  return schema.refine(
+    (value) => Buffer.byteLength(JSON.stringify(value), 'utf8') <= MAX_RECIPE_BYTES,
+    `A recipe can't be larger than ${MAX_RECIPE_BYTES / 1024}KB — shorten the description or remove some steps`
+  )
+}
+
+export const createRecipeSchema = withSizeLimit(recipeBaseSchema)
+export const updateRecipeSchema = withSizeLimit(recipeBaseSchema)
 
 export const favouriteSchema = z.object({
   // Must be present. `{ isFavourite: undefined }` is a no-op update that returns

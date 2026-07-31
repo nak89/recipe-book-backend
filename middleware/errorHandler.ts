@@ -11,6 +11,13 @@ export function notFoundHandler(_req: Request, res: Response) {
   res.status(404).json({ error: 'Not found' })
 }
 
+/** body-parser tags its failures with a `type` instead of subclassing Error. */
+function bodyParserType(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null || !('type' in err)) return undefined
+  const type = (err as { type: unknown }).type
+  return typeof type === 'string' ? type : undefined
+}
+
 export function errorHandler(err: unknown, _req: Request, res: Response, next: NextFunction) {
   if (res.headersSent) return next(err)
 
@@ -26,6 +33,13 @@ export function errorHandler(err: unknown, _req: Request, res: Response, next: N
       return res.status(400).json({ error: 'Unexpected file field — use "photo"' })
     }
     return res.status(400).json({ error: 'Invalid file upload' })
+  }
+
+  // A body over express.json()'s limit. body-parser throws a plain Error with a
+  // `type`, not a SyntaxError, so without this it fell to the generic 500 —
+  // hiding the one thing the client could actually act on.
+  if (bodyParserType(err) === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body is too large' })
   }
 
   // Malformed JSON body — express.json() throws a SyntaxError with .status set.

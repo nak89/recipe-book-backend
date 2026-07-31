@@ -142,6 +142,19 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
   const { ingredients, steps, ...recipe } = parsed.data
 
   try {
+    // Same per-user title rule as POST, minus this recipe itself — otherwise
+    // saving an edit without touching the title would collide with its own row.
+    const duplicate = await prisma.recipe.findFirst({
+      where: {
+        userId: req.userId,
+        title: { equals: recipe.title, mode: 'insensitive' },
+        NOT: { id: req.params.id },
+      },
+    })
+    if (duplicate) {
+      return res.status(409).json({ error: `You already have a recipe titled "${duplicate.title}"` })
+    }
+
     // One nested write instead of a manual $transaction. Prisma runs it
     // atomically, `deleteMany: {}` is scoped to this recipe's own children, and
     // the where — including userId — is evaluated *before* anything is deleted.

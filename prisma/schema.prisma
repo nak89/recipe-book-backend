@@ -33,6 +33,11 @@ model Recipe {
   //Breakfast | Lunch | Dinner | Snack — the mobile dashboard's filter chips.
   mealtime      String?
   isFavourite   Boolean   @default(false)
+  //Nutrition is PER SERVING, not per recipe, and is typed in by the user —
+  //nothing derives it from the ingredient list. The columns can't say so
+  //themselves, and the whole app depends on the convention. Null means "not
+  //known", which is why every one of them is nullable rather than defaulting
+  //to 0: a stored 0 would be a claim that this dish has no calories.
   calories      Float?
   protein       Float?
   carbs         Float?
