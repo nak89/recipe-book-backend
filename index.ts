@@ -12,7 +12,9 @@ import { requireAuth } from './middleware/auth.js'
 import uploadRoutes from './routes/upload.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { apiLimiter, authLimiter, uploadLimiter } from './rateLimits.js'
-import { createRecipeSchema, updateRecipeSchema, favouriteSchema, formatZodError } from './validation.js'
+import { createRecipeSchema, updateRecipeSchema, favouriteSchema, importSchema, formatZodError } from './validation.js'
+import { packSummaries, recipesForPacks } from './data/starterPacks.js'
+import { foldForCompare } from './lib/text.js'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
@@ -61,6 +63,14 @@ app.get('/', (req: Request, res: Response) => {
 // supabase.auth.getUser() call, so an unauthenticated flood would otherwise
 // turn into one outbound Supabase request per junk token.
 app.use('/recipes', apiLimiter)
+app.use('/starter-packs', apiLimiter)
+
+// Metadata for onboarding's pack picker. Deliberately does not include the
+// recipe bodies: the client only ever sends ids back, so shipping fifteen full
+// recipes to a screen shown once would be dead weight.
+app.get('/starter-packs', requireAuth, (req: Request, res: Response) => {
+  res.json(packSummaries())
+})
 
 app.get('/recipes', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -108,12 +118,20 @@ app.post('/recipes', requireAuth, async (req: Request, res: Response, next: Next
   const { ingredients, steps, ...recipe } = parsed.data
 
   try {
-    const existing = await prisma.recipe.findFirst({
-      where: {
-        userId: req.userId,
-        title: { equals: recipe.title, mode: 'insensitive' },
-      },
+    // Prisma's `mode: 'insensitive'` compares inside the database, so a JS fold
+    // can't be pushed into it — and case-insensitivity alone doesn't see through
+    // the invisible zero-width spaces Khmer keyboards emit at word boundaries,
+    // which let two identical-looking titles both save. Fetch this user's titles
+    // and compare folded, in JS; that's the same shape /recipes/import already
+    // uses. Costs a narrow scan per save instead of one indexed lookup, which is
+    // fine at personal-recipe-book scale and is the only way the check can see
+    // past an invisible character.
+    const wanted = foldForCompare(recipe.title)
+    const titles = await prisma.recipe.findMany({
+      where: { userId: req.userId },
+      select: { id: true, title: true },
     })
+    const existing = titles.find((r) => foldForCompare(r.title) === wanted)
     if (existing) {
       return res.status(409).json({ error: `You already have a recipe titled "${existing.title}"` })
     }
@@ -142,15 +160,15 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
   const { ingredients, steps, ...recipe } = parsed.data
 
   try {
-    // Same per-user title rule as POST, minus this recipe itself — otherwise
-    // saving an edit without touching the title would collide with its own row.
-    const duplicate = await prisma.recipe.findFirst({
-      where: {
-        userId: req.userId,
-        title: { equals: recipe.title, mode: 'insensitive' },
-        NOT: { id: req.params.id },
-      },
+    // Same per-user title rule as POST — including the fold, see the note there —
+    // minus this recipe itself, or saving an edit without touching the title
+    // would collide with its own row.
+    const wanted = foldForCompare(recipe.title)
+    const titles = await prisma.recipe.findMany({
+      where: { userId: req.userId, NOT: { id: req.params.id } },
+      select: { id: true, title: true },
     })
+    const duplicate = titles.find((r) => foldForCompare(r.title) === wanted)
     if (duplicate) {
       return res.status(409).json({ error: `You already have a recipe titled "${duplicate.title}"` })
     }
@@ -207,6 +225,84 @@ app.patch('/recipes/:id/favourite', requireAuth, async (req: Request<{ id: strin
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
       return res.status(404).json({ error: 'Recipe not found' })
     }
+    next(err)
+  }
+})
+
+/**
+ * Bulk-creates the recipes in the chosen starter packs. Onboarding only.
+ *
+ * A title the user already has is **skipped, not rejected**. The onboarding gate
+ * re-runs whenever `onboardedAt` is unset, so someone who imports and then
+ * force-quits before finishing comes back to the picker with every one of those
+ * titles already in their library — 409ing there would strand them on a screen
+ * naming recipes they never saw. Re-importing is a no-op instead.
+ *
+ * One transaction, not N creates: a half-finished import would leave a library
+ * the user didn't choose and no clean way to retry.
+ */
+app.post('/recipes/import', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = importSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error))
+  }
+
+  try {
+    const candidates = recipesForPacks(parsed.data.packIds)
+    const existing = await prisma.recipe.findMany({
+      where: { userId: req.userId },
+      select: { title: true },
+    })
+    // Folded, matching the uniqueness rule POST /recipes enforces — otherwise
+    // "carbonara" would slip past here and then be rejected the next time the
+    // user edited it. Same helper on both sides, so the two rules can't drift.
+    const taken = new Set(existing.map((r) => foldForCompare(r.title)))
+    const fresh = candidates.filter((r) => !taken.has(foldForCompare(r.title)))
+
+    if (fresh.length > 0) {
+      // Three statements, not three per recipe. The obvious shape here is a
+      // nested `create` per recipe, but fifteen of those is ~45 round-trips and
+      // reliably overran Prisma's 5s transaction timeout against a hosted
+      // database. Raising the timeout would only hold the transaction open
+      // longer; batching removes the work instead.
+      await prisma.$transaction(async (tx) => {
+        const created = await tx.recipe.createManyAndReturn({
+          data: fresh.map(({ ingredients, steps, ...recipe }) => ({
+            ...recipe,
+            userId: req.userId as string,
+          })),
+          select: { id: true, title: true },
+        })
+        // Titles are unique per user and we just filtered out every collision,
+        // so they're a safe key back to the generated ids.
+        const idByTitle = new Map(created.map((r) => [r.title, r.id]))
+
+        await tx.ingredient.createMany({
+          data: fresh.flatMap((recipe) =>
+            recipe.ingredients.map(([name, quantity, unit]) => ({
+              recipeId: idByTitle.get(recipe.title) as string,
+              name,
+              quantity,
+              unit,
+            }))
+          ),
+        })
+
+        await tx.step.createMany({
+          data: fresh.flatMap((recipe) =>
+            recipe.steps.map((instruction, index) => ({
+              recipeId: idByTitle.get(recipe.title) as string,
+              stepNumber: index + 1,
+              instruction,
+            }))
+          ),
+        })
+      })
+    }
+
+    // Zero imported is a success, not an error — see the re-import case above.
+    res.json({ imported: fresh.length, skipped: candidates.length - fresh.length })
+  } catch (err) {
     next(err)
   }
 })

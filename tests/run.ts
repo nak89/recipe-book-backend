@@ -22,6 +22,23 @@ import {
   PNG_1X1,
   MALICIOUS_SVG,
 } from './harness.js'
+import { STARTER_PACKS, type StarterRecipe } from '../data/starterPacks.js'
+import { createRecipeSchema } from '../validation.js'
+
+/**
+ * The packaged shape (tuple ingredients, bare step strings) rendered as the
+ * body a client would POST, so the packs can be checked against the very schema
+ * user-submitted recipes go through. The import route builds its Prisma input
+ * the same way — if these two ever disagree, this test is the one that says so.
+ */
+function asApiBody(recipe: StarterRecipe) {
+  const { ingredients, steps, ...rest } = recipe
+  return {
+    ...rest,
+    ingredients: ingredients.map(([name, quantity, unit]) => ({ name, quantity, unit })),
+    steps: steps.map((instruction, index) => ({ stepNumber: index + 1, instruction })),
+  }
+}
 
 const admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SECRET_KEY!, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -324,6 +341,24 @@ async function main() {
       body: JSON.stringify(validRecipe({ title: title.toUpperCase() })),
     })
     expectStatus(res, 409)
+  })
+
+  // Khmer marks word boundaries with an invisible zero-width space, and keyboards
+  // emit them inconsistently — so the same title typed on two devices can differ
+  // by a character nobody can see. `.trim()` doesn't strip it (it's category Cf,
+  // not Zs), `.toLowerCase()` ignores it and NFC doesn't delete it, so the old
+  // `mode: 'insensitive'` comparison called these two titles different and let
+  // both save. This pins the fold that fixes it.
+  await test('duplicate title differing only by a zero-width space is rejected', async () => {
+    const withZwsp = `${title.slice(0, 3)}​${title.slice(3)}`
+    expect(withZwsp !== title, 'test is vacuous — the ZWSP was not inserted')
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ title: withZwsp })),
+    })
+    expectStatus(res, 409, 'an invisible character slipped past the uniqueness check')
+    return '409 — the fold saw through the invisible character'
   })
 
   await test('a different user may reuse the same title', async () => {
@@ -709,8 +744,149 @@ async function main() {
     return 'nosniff + frame options set'
   })
 
+  group('10. Starter packs — the onboarding import')
+
+  await test('GET /starter-packs needs a token', async () => {
+    const res = await api('/starter-packs')
+    expect(res.status === 401, `expected 401, got ${res.status}`)
+    return 'picker metadata is not public'
+  })
+
+  await test('GET /starter-packs returns the packs without their recipe bodies', async () => {
+    const res = await api('/starter-packs', { token: alice.token })
+    expectStatus(res, 200)
+    expect(Array.isArray(res.body) && res.body.length === STARTER_PACKS.length, `got ${JSON.stringify(res.body)?.slice(0, 80)}`)
+    // The whole reason ids cross the wire instead of recipes: a picker shown
+    // once should not download fifteen recipes to render three cards.
+    expect(res.body.every((p: any) => p.recipes === undefined), 'recipe bodies leaked into the summary')
+    expect(res.body.every((p: any) => typeof p.count === 'number' && p.count > 0), 'missing count')
+    return res.body.map((p: any) => `${p.id}(${p.count})`).join(' ')
+  })
+
+  await test('every packaged recipe passes the same schema a user POST must', async () => {
+    // Pins the photoUrl allowlist and the 60KB cap at test time rather than at
+    // some user's first launch — this content never goes through POST /recipes,
+    // so nothing else would ever check it.
+    for (const pack of STARTER_PACKS) {
+      for (const recipe of pack.recipes) {
+        const parsed = createRecipeSchema.safeParse(asApiBody(recipe))
+        expect(parsed.success, `${pack.id}/${recipe.title}: ${parsed.success ? '' : parsed.error.issues[0]?.message}`)
+      }
+    }
+    return `${STARTER_PACKS.reduce((n, p) => n + p.recipes.length, 0)} recipes validated`
+  })
+
+  await test('importing one pack creates exactly its recipes, owned by the caller', async () => {
+    const before = (await api('/recipes', { token: alice.token })).body.length
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ packIds: ['southeast-asian'] }),
+    })
+    expectStatus(res, 200)
+    const pack = STARTER_PACKS.find((p) => p.id === 'southeast-asian')!
+    expect(res.body.imported === pack.recipes.length, `imported ${res.body.imported}, expected ${pack.recipes.length}`)
+    expect(res.body.skipped === 0, `skipped ${res.body.skipped} on a clean account`)
+    const after = await api('/recipes', { token: alice.token })
+    expect(after.body.length === before + pack.recipes.length, `grid went ${before} → ${after.body.length}`)
+    const owned = await prisma.recipe.count({ where: { userId: alice.id, title: { in: pack.recipes.map((r) => r.title) } } })
+    expect(owned === pack.recipes.length, `${owned} of ${pack.recipes.length} rows carry alice's userId`)
+    return `${res.body.imported} imported, all scoped to the caller`
+  })
+
+  await test('imported recipes arrive with their ingredients and ordered steps', async () => {
+    const first = STARTER_PACKS[0].recipes[0]
+    const res = await api('/recipes', { token: alice.token })
+    const row = res.body.find((r: any) => r.title === first.title)
+    expect(row !== undefined, `${first.title} not in the list`)
+    expect(row.ingredients.length === first.ingredients.length, `${row.ingredients.length} ingredients, expected ${first.ingredients.length}`)
+    expect(row.steps.length === first.steps.length, `${row.steps.length} steps, expected ${first.steps.length}`)
+    const numbers = row.steps.map((s: any) => s.stepNumber)
+    expect(numbers.join(',') === numbers.slice().sort((a: number, b: number) => a - b).join(','), `steps out of order: ${numbers}`)
+    return `${row.ingredients.length} ingredients, ${row.steps.length} steps in order`
+  })
+
+  await test('re-importing the same pack is a no-op, not a 409', async () => {
+    // The onboarding gate re-runs while onboardedAt is unset, so this is the
+    // ordinary path for anyone who force-quits mid-flow — not an edge case.
+    const before = (await api('/recipes', { token: alice.token })).body.length
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ packIds: ['southeast-asian'] }),
+    })
+    expectStatus(res, 200)
+    expect(res.body.imported === 0, `imported ${res.body.imported} duplicates`)
+    expect(res.body.skipped === STARTER_PACKS[0].recipes.length, `skipped ${res.body.skipped}`)
+    const after = (await api('/recipes', { token: alice.token })).body.length
+    expect(after === before, `grid changed ${before} → ${after}`)
+    return `0 imported, ${res.body.skipped} skipped, nothing duplicated`
+  })
+
+  await test('a collision is matched case-insensitively', async () => {
+    const title = STARTER_PACKS[1].recipes[0].title
+    const created = await api('/recipes', {
+      method: 'POST',
+      token: bob.token,
+      body: JSON.stringify(validRecipe({ title: title.toUpperCase() })),
+    })
+    expectStatus(created, 201)
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      token: bob.token,
+      body: JSON.stringify({ packIds: ['mediterranean'] }),
+    })
+    expectStatus(res, 200)
+    expect(res.body.skipped === 1, `skipped ${res.body.skipped}, expected the upper-cased title to collide`)
+    return `"${title.toUpperCase()}" blocked "${title}"`
+  })
+
+  await test('importing every pack creates one row per distinct title', async () => {
+    const fresh = await makeUser('packs')
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      token: fresh.token,
+      body: JSON.stringify({ packIds: STARTER_PACKS.map((p) => p.id) }),
+    })
+    expectStatus(res, 200)
+    const distinct = new Set(STARTER_PACKS.flatMap((p) => p.recipes.map((r) => r.title.toLowerCase()))).size
+    expect(res.body.imported === distinct, `imported ${res.body.imported}, expected ${distinct} distinct`)
+    const list = await api('/recipes', { token: fresh.token })
+    expect(list.body.length === distinct, `grid holds ${list.body.length}`)
+    return `${distinct} recipes from ${STARTER_PACKS.length} packs, one request`
+  })
+
+  await test('an unknown pack id is rejected', async () => {
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ packIds: ['not-a-pack'] }),
+    })
+    expectStatus(res, 400)
+    return res.body.error
+  })
+
+  await test('an empty selection is rejected', async () => {
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ packIds: [] }),
+    })
+    expectStatus(res, 400)
+    return res.body.error
+  })
+
+  await test('import needs a token', async () => {
+    const res = await api('/recipes/import', {
+      method: 'POST',
+      body: JSON.stringify({ packIds: ['mediterranean'] }),
+    })
+    expect(res.status === 401, `expected 401, got ${res.status}`)
+    return 'no anonymous imports'
+  })
+
   // ── Rate limiting (runs last: it deliberately exhausts the buckets) ───────
-  group('10. Rate limiting')
+  group('11. Rate limiting')
 
   await test('repeated failed logins are throttled (limit 10 / 15 min)', async () => {
     let throttledAt = 0

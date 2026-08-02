@@ -8,6 +8,7 @@
 // lot of rows.
 
 import { z } from 'zod'
+import { STARTER_PACK_IDS } from './data/starterPacks.js'
 
 // A photoUrl is stored and later fetched by every device that views the recipe.
 // Left unconstrained it's an arbitrary outbound request to a host of the
@@ -131,6 +132,18 @@ export const favouriteSchema = z.object({
   // 200, so the app's optimistic toggle would report success on a write that
   // never happened.
   isFavourite: z.boolean(),
+})
+
+/**
+ * Onboarding's starter-pack import. The body carries ids only — the recipe
+ * bodies live on the server, because fifteen of them would not fit inside
+ * `express.json`'s 100kb limit and would cost fifteen separate auth calls.
+ *
+ * `.max(3)` is the number of packs that exist, not an arbitrary ceiling: it
+ * bounds the work a single request can ask for without needing its own rule.
+ */
+export const importSchema = z.object({
+  packIds: z.array(z.enum(STARTER_PACK_IDS)).min(1, 'Pick at least one pack').max(STARTER_PACK_IDS.length),
 })
 
 export const credentialsSchema = z.object({
