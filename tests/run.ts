@@ -885,8 +885,204 @@ async function main() {
     return 'no anonymous imports'
   })
 
+  // ── Meal planner ──────────────────────────────────────────────────────────
+  group('11. Meal planner — slots, scoping and the cascade')
+
+  // A fixed week well clear of today, so these rows can't collide with anything
+  // a developer has planned in the same database while running this.
+  const MON = '2031-03-03'
+  const TUE = '2031-03-04'
+  const WEEK = { from: MON, to: '2031-03-09' }
+  const range = (q: { from: string; to: string }) => `/meal-plan?from=${q.from}&to=${q.to}`
+
+  let plannedRecipeId = ''
+
+  await test('a recipe to plan', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ title: `QA Planned ${randomUUID().slice(0, 6)}` })),
+    })
+    expectStatus(res, 201)
+    plannedRecipeId = res.body.id
+    return `id=${plannedRecipeId.slice(0, 8)}…`
+  })
+
+  await test('an empty week is an empty array, not a 404', async () => {
+    const res = await api(range(WEEK), { token: alice.token })
+    expectStatus(res, 200)
+    expect(Array.isArray(res.body), 'expected an array')
+    expect(res.body.length === 0, `expected 0 slots, got ${res.body.length}`)
+  })
+
+  await test('PUT fills a slot', async () => {
+    const res = await api(`/meal-plan/${MON}/Dinner`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: plannedRecipeId }),
+    })
+    expectStatus(res, 200)
+    expect(res.body.date === MON, `date came back as ${res.body.date}, expected ${MON}`)
+    expect(res.body.mealtime === 'Dinner', `mealtime came back as ${res.body.mealtime}`)
+    expect(res.body.recipe?.title !== undefined, 'expected the recipe to be embedded')
+    return `${res.body.date} ${res.body.mealtime}`
+  })
+
+  await test('the date survives the round trip as a plain calendar day', async () => {
+    // The regression this pins: storing a timestamp instead of a DATE makes the
+    // day depend on the writing timezone, and the slot silently moves.
+    const res = await api(range(WEEK), { token: alice.token })
+    expectStatus(res, 200)
+    expect(res.body.length === 1, `expected 1 slot, got ${res.body.length}`)
+    expect(res.body[0].date === MON, `read back ${res.body[0].date}, wrote ${MON}`)
+    return res.body[0].date
+  })
+
+  await test('PUT to the same slot overwrites rather than accumulating', async () => {
+    const second = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(validRecipe({ title: `QA Replacement ${randomUUID().slice(0, 6)}` })),
+    })
+    expectStatus(second, 201)
+    const res = await api(`/meal-plan/${MON}/Dinner`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: second.body.id }),
+    })
+    expectStatus(res, 200)
+    const week = await api(range(WEEK), { token: alice.token })
+    expect(week.body.length === 1, `slot duplicated — ${week.body.length} rows for one slot`)
+    expect(week.body[0].recipeId === second.body.id, 'slot still points at the old recipe')
+    return 'one row, replaced'
+  })
+
+  await test('the same day holds a different mealtime independently', async () => {
+    const res = await api(`/meal-plan/${MON}/Breakfast`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: plannedRecipeId }),
+    })
+    expectStatus(res, 200)
+    const week = await api(range(WEEK), { token: alice.token })
+    expect(week.body.length === 2, `expected 2 slots, got ${week.body.length}`)
+    return '2 slots on one day'
+  })
+
+  await test('a range excludes days outside it', async () => {
+    const res = await api(range({ from: TUE, to: TUE }), { token: alice.token })
+    expectStatus(res, 200)
+    expect(res.body.length === 0, "Monday's slots leaked into a Tuesday-only range")
+  })
+
+  await test('an unknown mealtime is rejected', async () => {
+    const res = await api(`/meal-plan/${MON}/Brunch`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: plannedRecipeId }),
+    })
+    expectStatus(res, 400)
+    return res.body.error
+  })
+
+  for (const [label, date] of [
+    ['a malformed date', '03-03-2031'],
+    ['a date that is not a real day', '2031-02-31'],
+    ['a timestamp rather than a date', '2031-03-03T00:00:00Z'],
+  ] as const) {
+    await test(`PUT rejects ${label}`, async () => {
+      const res = await api(`/meal-plan/${encodeURIComponent(date)}/Dinner`, {
+        method: 'PUT',
+        token: alice.token,
+        body: JSON.stringify({ recipeId: plannedRecipeId }),
+      })
+      expectStatus(res, 400)
+      return res.body.error
+    })
+  }
+
+  await test('GET requires a range', async () => {
+    const res = await api('/meal-plan', { token: alice.token })
+    expectStatus(res, 400)
+    return res.body.error
+  })
+
+  await test('GET rejects a backwards range', async () => {
+    const res = await api(range({ from: '2031-03-09', to: MON }), { token: alice.token })
+    expectStatus(res, 400)
+    return res.body.error
+  })
+
+  await test('GET rejects a range over 366 days', async () => {
+    const res = await api(range({ from: '2031-01-01', to: '2032-06-01' }), { token: alice.token })
+    expectStatus(res, 400)
+    return res.body.error
+  })
+
+  await test('planning needs a token', async () => {
+    const res = await api(`/meal-plan/${MON}/Lunch`, {
+      method: 'PUT',
+      body: JSON.stringify({ recipeId: plannedRecipeId }),
+    })
+    expect(res.status === 401, `expected 401, got ${res.status}`)
+    return 'no anonymous planning'
+  })
+
+  await test("bob cannot plan alice's recipe", async () => {
+    // The FK proves the recipe exists; only the ownership check stops bob using
+    // it as an oracle for alice's titles and photos via GET.
+    const res = await api(`/meal-plan/${MON}/Dinner`, {
+      method: 'PUT',
+      token: bob.token,
+      body: JSON.stringify({ recipeId: plannedRecipeId }),
+    })
+    expectStatus(res, 404)
+    return '404, not 403 — the id is not confirmed'
+  })
+
+  await test("bob's week does not show alice's slots", async () => {
+    const res = await api(range(WEEK), { token: bob.token })
+    expectStatus(res, 200)
+    expect(res.body.length === 0, `bob can see ${res.body.length} of alice's planned meals`)
+  })
+
+  await test("bob cannot clear alice's slot", async () => {
+    const res = await api(`/meal-plan/${MON}/Dinner`, { method: 'DELETE', token: bob.token })
+    expectStatus(res, 404)
+    const week = await api(range(WEEK), { token: alice.token })
+    expect(week.body.length === 2, "alice lost a slot to bob's delete")
+    return "alice's slots intact"
+  })
+
+  await test('DELETE clears a slot', async () => {
+    const res = await api(`/meal-plan/${MON}/Breakfast`, { method: 'DELETE', token: alice.token })
+    expectStatus(res, 204)
+    const week = await api(range(WEEK), { token: alice.token })
+    expect(week.body.length === 1, `expected 1 slot left, got ${week.body.length}`)
+    return '204'
+  })
+
+  await test('DELETE on an empty slot is a 404', async () => {
+    const res = await api(`/meal-plan/${MON}/Breakfast`, { method: 'DELETE', token: alice.token })
+    expectStatus(res, 404)
+    return res.body.error
+  })
+
+  await test('deleting a recipe unplans it', async () => {
+    // The cascade, end to end: a slot pointing at a recipe that no longer exists
+    // has nothing to render, so unplanning has to follow deleting.
+    const week = await api(range(WEEK), { token: alice.token })
+    const remaining = week.body[0]
+    expect(remaining !== undefined, 'expected a slot to still be planned')
+    const del = await api(`/recipes/${remaining.recipeId}`, { method: 'DELETE', token: alice.token })
+    expectStatus(del, 204)
+    const after = await api(range(WEEK), { token: alice.token })
+    expect(after.body.length === 0, `${after.body.length} orphaned slot(s) survived the recipe delete`)
+    return 'slot removed with the recipe'
+  })
+
   // ── Rate limiting (runs last: it deliberately exhausts the buckets) ───────
-  group('11. Rate limiting')
+  group('12. Rate limiting')
 
   await test('repeated failed logins are throttled (limit 10 / 15 min)', async () => {
     let throttledAt = 0

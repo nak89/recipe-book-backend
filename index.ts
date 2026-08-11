@@ -12,7 +12,16 @@ import { requireAuth } from './middleware/auth.js'
 import uploadRoutes from './routes/upload.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { apiLimiter, authLimiter, uploadLimiter } from './rateLimits.js'
-import { createRecipeSchema, updateRecipeSchema, favouriteSchema, importSchema, formatZodError } from './validation.js'
+import {
+  createRecipeSchema,
+  updateRecipeSchema,
+  favouriteSchema,
+  importSchema,
+  planRangeSchema,
+  planSlotParamsSchema,
+  planSlotSchema,
+  formatZodError,
+} from './validation.js'
 import { packSummaries, recipesForPacks } from './data/starterPacks.js'
 import { foldForCompare } from './lib/text.js'
 
@@ -64,6 +73,7 @@ app.get('/', (req: Request, res: Response) => {
 // turn into one outbound Supabase request per junk token.
 app.use('/recipes', apiLimiter)
 app.use('/starter-packs', apiLimiter)
+app.use('/meal-plan', apiLimiter)
 
 // Metadata for onboarding's pack picker. Deliberately does not include the
 // recipe bodies: the client only ever sends ids back, so shipping fifteen full
@@ -306,6 +316,148 @@ app.post('/recipes/import', requireAuth, async (req: Request, res: Response, nex
     next(err)
   }
 })
+
+/**
+ * The meal planner. Three routes over one table, and the table is a set of
+ * slots: (date, mealtime) addresses exactly one recipe for one account.
+ *
+ * That shape is why there is no POST. A slot always exists conceptually —
+ * Tuesday has a dinner whether or not you've chosen it — so filling one is an
+ * idempotent PUT to a known address, not the creation of a new resource. Two
+ * taps on the same slot leave one row, which is what the `@@unique` enforces
+ * and what makes the app's optimistic writes safe to retry.
+ *
+ * `date` is handled as a plain `YYYY-MM-DD` string end to end and only becomes
+ * a `Date` at the Prisma boundary, pinned to UTC midnight. The column is a
+ * postgres DATE with no time or zone, so any other instant would be re-read as
+ * a different day somewhere in the world.
+ */
+
+/** The `YYYY-MM-DD` a DATE column round-trips to, without a timezone in sight. */
+function toDateOnly(value: string) {
+  return new Date(`${value}T00:00:00.000Z`)
+}
+
+function fromDateOnly(value: Date) {
+  return value.toISOString().slice(0, 10)
+}
+
+// The planner renders a row per slot: a photo, a title and the two meta values.
+// It deliberately doesn't `include` the whole recipe — ingredients and steps are
+// dead weight on a screen that shows neither, and a full week of them would be
+// the largest response the API sends.
+const plannerRecipeSelect = {
+  id: true,
+  title: true,
+  photoUrl: true,
+  totalMinutes: true,
+  servings: true,
+  mealtime: true,
+} as const
+
+app.get('/meal-plan', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = planRangeSchema.safeParse(req.query)
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error))
+  }
+  try {
+    const slots = await prisma.mealPlan.findMany({
+      where: {
+        userId: req.userId,
+        date: { gte: toDateOnly(parsed.data.from), lte: toDateOnly(parsed.data.to) },
+      },
+      select: {
+        id: true,
+        date: true,
+        mealtime: true,
+        recipeId: true,
+        recipe: { select: plannerRecipeSelect },
+      },
+      orderBy: [{ date: 'asc' }, { mealtime: 'asc' }],
+    })
+    res.json(slots.map((slot) => ({ ...slot, date: fromDateOnly(slot.date) })))
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.put(
+  '/meal-plan/:date/:mealtime',
+  requireAuth,
+  async (req: Request<{ date: string; mealtime: string }>, res: Response, next: NextFunction) => {
+    const slot = planSlotParamsSchema.safeParse(req.params)
+    if (!slot.success) {
+      return res.status(400).json(formatZodError(slot.error))
+    }
+    const body = planSlotSchema.safeParse(req.body)
+    if (!body.success) {
+      return res.status(400).json(formatZodError(body.error))
+    }
+    try {
+      // Check the recipe is *this user's* before writing. The FK only proves the
+      // recipe exists; without this an account could plan a stranger's recipe by
+      // id and then read its title and photo straight back out of GET.
+      const recipe = await prisma.recipe.findFirst({
+        where: { id: body.data.recipeId, userId: req.userId },
+        select: { id: true },
+      })
+      if (!recipe) {
+        return res.status(404).json({ error: 'Recipe not found' })
+      }
+      const date = toDateOnly(slot.data.date)
+      const saved = await prisma.mealPlan.upsert({
+        where: {
+          userId_date_mealtime: { userId: req.userId!, date, mealtime: slot.data.mealtime },
+        },
+        create: {
+          userId: req.userId!,
+          date,
+          mealtime: slot.data.mealtime,
+          recipeId: body.data.recipeId,
+        },
+        update: { recipeId: body.data.recipeId },
+        select: {
+          id: true,
+          date: true,
+          mealtime: true,
+          recipeId: true,
+          recipe: { select: plannerRecipeSelect },
+        },
+      })
+      res.json({ ...saved, date: fromDateOnly(saved.date) })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+app.delete(
+  '/meal-plan/:date/:mealtime',
+  requireAuth,
+  async (req: Request<{ date: string; mealtime: string }>, res: Response, next: NextFunction) => {
+    const slot = planSlotParamsSchema.safeParse(req.params)
+    if (!slot.success) {
+      return res.status(400).json(formatZodError(slot.error))
+    }
+    try {
+      await prisma.mealPlan.delete({
+        where: {
+          userId_date_mealtime: {
+            userId: req.userId!,
+            date: toDateOnly(slot.data.date),
+            mealtime: slot.data.mealtime,
+          },
+        },
+      })
+      res.status(204).send()
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+        return res.status(404).json({ error: 'Nothing planned in that slot' })
+      }
+      next(err)
+    }
+  }
+)
 
 app.use('/upload', uploadLimiter, uploadRoutes)
 

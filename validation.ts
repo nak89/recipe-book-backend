@@ -146,6 +146,68 @@ export const importSchema = z.object({
   packIds: z.array(z.enum(STARTER_PACK_IDS)).min(1, 'Pick at least one pack').max(STARTER_PACK_IDS.length),
 })
 
+/**
+ * The meal planner's four mealtime slots. Deliberately the same four stored
+ * English values as `Recipe.mealtime` — a planner slot and a recipe's own
+ * mealtime are the same vocabulary, and duplicating the list here rather than
+ * sharing one const is how they'd silently drift.
+ */
+export const MEALTIMES = ['Breakfast', 'Lunch', 'Dinner', 'Snack'] as const
+
+/**
+ * A calendar date, `YYYY-MM-DD`, and nothing else.
+ *
+ * The regex is not belt-and-braces over `new Date()`: `Date.parse` accepts
+ * `2026-8-9`, `2026-08-09T22:00:00Z` and a pile of implementation-defined
+ * formats, all of which would round-trip to a *different* string than the client
+ * sent and quietly miss the unique constraint the slot depends on. The range
+ * check then rejects `2026-02-31`, which matches the shape but isn't a day —
+ * re-serialising and comparing is what catches the rollover.
+ */
+const dateSchema = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be YYYY-MM-DD')
+  .refine((value) => {
+    const parsed = new Date(`${value}T00:00:00Z`)
+    return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value
+  }, 'Date must be a real calendar date')
+
+/**
+ * A slot's address: the two path params of a PUT or DELETE. Parsed rather than
+ * trusted, because both go straight into a compound unique lookup — an
+ * unvalidated `mealtime` would create a slot named whatever the client sent,
+ * and it would then be invisible to a planner that only asks for the four.
+ */
+export const planSlotParamsSchema = z.object({
+  date: dateSchema,
+  mealtime: z.enum(MEALTIMES),
+})
+
+/** The body of a slot write. The date and mealtime are path params, not body. */
+export const planSlotSchema = z.object({
+  recipeId: z.uuid('A recipe id is required'),
+})
+
+/**
+ * The planner reads a week at a time, so the range is required rather than
+ * defaulted — an unbounded GET would return every meal the account has ever
+ * planned, and grow without limit.
+ *
+ * 366 days is the cap. It's generous for a screen that shows seven, but the
+ * bound exists to stop one request scanning the whole table, not to express a
+ * product rule.
+ */
+export const planRangeSchema = z
+  .object({ from: dateSchema, to: dateSchema })
+  .refine((value) => value.from <= value.to, {
+    message: '`from` must be on or before `to`',
+    path: ['from'],
+  })
+  .refine((value) => {
+    const days = (Date.parse(`${value.to}T00:00:00Z`) - Date.parse(`${value.from}T00:00:00Z`)) / 86_400_000
+    return days <= 366
+  }, { message: 'Range must be 366 days or fewer', path: ['to'] })
+
 export const credentialsSchema = z.object({
   email: z.email('A valid email is required').max(320),
   password: z.string().min(8, 'Password must be at least 8 characters').max(128),

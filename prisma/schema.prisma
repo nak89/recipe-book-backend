@@ -45,9 +45,40 @@ model Recipe {
   ingredients   Ingredient[]
   tools         String[]
   steps         Step[]
+  mealPlans     MealPlan[]
   createdAt     DateTime  @default(now())
   userId        String
 
+}
+
+//One planned meal: a recipe in one mealtime slot on one day.
+//
+//`date` is a DATE, not a timestamp, and that is load-bearing. A plan is a
+//calendar fact — "Tuesday's dinner" — not an instant, so a timestamp would make
+//the row's identity depend on the timezone that wrote it, and the same plan
+//would land on a different day for a user who travelled.
+//
+//The unique constraint is what makes a slot a slot: one recipe per mealtime per
+//day, so writing a slot overwrites rather than accumulating. It includes
+//`userId` because two accounts can plan the same dinner on the same night.
+//
+//`recipeId` cascades — unplanning follows deleting, since a slot pointing at a
+//recipe that no longer exists has nothing to render. `userId` is a plain
+//scoping column with no relation, exactly as on Recipe: that table is Supabase's.
+model MealPlan {
+  id            String    @id   @default(uuid())
+  userId        String
+  date          DateTime  @db.Date
+  //Breakfast | Lunch | Dinner | Snack — the same stored English values as
+  //Recipe.mealtime, translated at the display layer and never in the database.
+  mealtime      String
+  recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  recipeId      String
+  createdAt     DateTime  @default(now())
+
+  @@unique([userId, date, mealtime])
+  //The planner always reads a week at a time, and always for one user.
+  @@index([userId, date])
 }
 
 model Ingredient {
