@@ -655,7 +655,14 @@ async function insert(userId: string) {
         ...rest,
         ...nutritionFor(recipe.title),
         userId,
-        ingredients: { create: ingredients.map(([name, quantity, unit]) => ({ name, quantity, unit })) },
+        ingredients: {
+          create: ingredients.map(([name, quantity, unit], position) => ({
+            name,
+            quantity,
+            unit,
+            position,
+          })),
+        },
         steps: { create: steps.map((instruction, i) => ({ stepNumber: i + 1, instruction })) },
       },
     })

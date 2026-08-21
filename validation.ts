@@ -14,8 +14,14 @@ import { STARTER_PACK_IDS } from './data/starterPacks.js'
 // Left unconstrained it's an arbitrary outbound request to a host of the
 // submitter's choosing, so restrict it to hosts we actually serve images from.
 // Unsplash is here because prisma/seed.ts uses it — drop it if you drop the seed.
+//
+// Squarespace is here because `data/library.ts` uses it: the shared library's
+// photography lives on chefnak.com. It has to be on this list rather than only
+// trusted at copy time, because a copied recipe keeps the library's photoUrl and
+// `PUT /recipes` re-validates it on the user's first edit — without the host
+// here, copying a recipe would produce one that could never be saved again.
 function storageHosts(): string[] {
-  const hosts = ['images.unsplash.com']
+  const hosts = ['images.unsplash.com', 'images.squarespace-cdn.com']
   try {
     if (process.env.SUPABASE_URL) hosts.push(new URL(process.env.SUPABASE_URL).host)
   } catch {
@@ -46,9 +52,24 @@ const ingredientSchema = z.object({
   unit: z.string().trim().max(50),
 })
 
+/**
+ * Twelve hours. Not a product rule — a stock or a cure genuinely runs that long
+ * — but a bound, so a slipped keystroke can't store a countdown nothing will
+ * ever finish. One second is the floor for the same reason zero would be wrong:
+ * a zero-second timer is an unset timer, and `null` already means that.
+ */
+export const MAX_STEP_SECONDS = 12 * 60 * 60
+
 const stepSchema = z.object({
   stepNumber: z.number().int().min(1).max(1000),
   instruction: z.string().trim().min(1, 'Step instruction is required').max(2000),
+  // `.nullable().optional()` for the same reason the nutrition columns are:
+  // Prisma reads an omitted field in an update as "leave this column alone", so
+  // clearing a timer has to send an explicit null to actually clear it. `PUT`
+  // deletes and recreates every step row, so the distinction is less load-
+  // bearing here than on the recipe's own columns — but the shape should not
+  // depend on that implementation detail staying true.
+  durationSeconds: z.number().int().min(1).max(MAX_STEP_SECONDS).nullable().optional(),
 })
 
 // Nutrition is *per serving*, so these bounds are what one plate can plausibly
@@ -146,6 +167,13 @@ export const importSchema = z.object({
   packIds: z.array(z.enum(STARTER_PACK_IDS)).min(1, 'Pick at least one pack').max(STARTER_PACK_IDS.length),
 })
 
+// `copyLibrarySchema` used to live here. Copying out of the shared library took
+// a `language` in its body, because the library shipped in two and the language
+// decided which of `title`/`titleKm` was stored. `data/library.ts` is Khmer
+// only now, so there is nothing to choose: `/library/:id/copy` and
+// `/library/import` take no body at all, and the recipe is addressed entirely
+// by its URL.
+
 /**
  * The meal planner's four mealtime slots. Deliberately the same four stored
  * English values as `Recipe.mealtime` — a planner slot and a recipe's own
@@ -207,6 +235,60 @@ export const planRangeSchema = z
     const days = (Date.parse(`${value.to}T00:00:00Z`) - Date.parse(`${value.from}T00:00:00Z`)) / 86_400_000
     return days <= 366
   }, { message: 'Range must be 366 days or fewer', path: ['to'] })
+
+/**
+ * How many manual "Added by you" items one account may hold in one week.
+ *
+ * A bound rather than a product rule: without one, a loop in a client can fill
+ * the table, and every `GET /grocery` afterwards has to read all of it back.
+ */
+export const MAX_GROCERY_ITEMS_PER_WEEK = 200
+
+/**
+ * The grocery list is derived over a date range, exactly as the planner is, so
+ * it takes the planner's range rules unchanged — required, ordered, and capped
+ * at 366 days so one request can't scan the whole plan.
+ */
+export const groceryRangeSchema = planRangeSchema
+
+/**
+ * A line's state write: a tick, an amount correction, or both.
+ *
+ * `key` is opaque here on purpose. The server builds it during derivation and
+ * the client sends back whatever it was given; re-validating its *shape* would
+ * duplicate the derivation's rules in a second place and go stale the moment
+ * they changed. Bounding its length is enough to stop a hostile client writing
+ * a megabyte into an indexed column.
+ *
+ * `amountOverride` is `.nullable()` as well as `.optional()`, and the two mean
+ * different things — the same trap the nutrition columns set. Omitted leaves a
+ * stored override alone; an explicit `null` clears it, so the line goes back to
+ * reporting the plan's own sum. Only `.nullable()` lets that `null` through.
+ */
+export const groceryLineSchema = z.object({
+  weekStart: dateSchema,
+  key: z.string().min(1, 'A line key is required').max(500),
+  ticked: z.boolean().optional(),
+  amountOverride: z.number().finite().min(0).max(100_000).nullable().optional(),
+})
+
+/** A manual item. Mirrors `ingredientSchema` — it is the same kind of thing. */
+export const groceryItemSchema = z.object({
+  weekStart: dateSchema,
+  name: z.string().trim().min(1, 'An ingredient name is required').max(200),
+  amount: z.number().finite().min(0).max(100_000),
+  unit: z.string().trim().max(50),
+})
+
+/** A manual item edit. Every field optional, but at least one must be present. */
+export const groceryItemPatchSchema = z
+  .object({
+    name: z.string().trim().min(1, 'An ingredient name is required').max(200).optional(),
+    amount: z.number().finite().min(0).max(100_000).optional(),
+    unit: z.string().trim().max(50).optional(),
+    ticked: z.boolean().optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, { message: 'Nothing to update' })
 
 export const credentialsSchema = z.object({
   email: z.email('A valid email is required').max(320),

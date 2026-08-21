@@ -27,10 +27,10 @@ async function main() {
         userId: seedUserId,
         ingredients: {
             create: [
-            { name: "spaghetti", quantity: 400, unit: "g" },
-            { name: "eggs", quantity: 4, unit: "whole" },
-            { name: "pancetta", quantity: 150, unit: "g" },
-            { name: "parmesan", quantity: 50, unit: "g" },
+            { name: "spaghetti", quantity: 400, unit: "g", position: 0 },
+            { name: "eggs", quantity: 4, unit: "whole", position: 1 },
+            { name: "pancetta", quantity: 150, unit: "g", position: 2 },
+            { name: "parmesan", quantity: 50, unit: "g", position: 3 },
             ],
         },
         steps: {
@@ -55,9 +55,9 @@ async function main() {
         userId: seedUserId,
         ingredients: {
             create: [
-            { name: "bread", quantity: 2, unit: "whole" },
-            { name: "avocado", quantity: 1, unit: "whole" },
-            { name: "lemon juice", quantity: 1, unit: "tsp" },
+            { name: "bread", quantity: 2, unit: "whole", position: 0 },
+            { name: "avocado", quantity: 1, unit: "whole", position: 1 },
+            { name: "lemon juice", quantity: 1, unit: "tsp", position: 2 },
             ],
         },
         steps: {

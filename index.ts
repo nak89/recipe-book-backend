@@ -20,10 +20,17 @@ import {
   planRangeSchema,
   planSlotParamsSchema,
   planSlotSchema,
+  groceryRangeSchema,
+  groceryLineSchema,
+  groceryItemSchema,
+  groceryItemPatchSchema,
+  MAX_GROCERY_ITEMS_PER_WEEK,
   formatZodError,
 } from './validation.js'
 import { packSummaries, recipesForPacks } from './data/starterPacks.js'
+import { LIBRARY, librarySummaries, libraryRecipe, libraryDetail } from './data/library.js'
 import { foldForCompare } from './lib/text.js'
+import { aggregateIngredients, roundAmount } from './lib/grocery.js'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
 const prisma = new PrismaClient({ adapter })
@@ -73,7 +80,9 @@ app.get('/', (req: Request, res: Response) => {
 // turn into one outbound Supabase request per junk token.
 app.use('/recipes', apiLimiter)
 app.use('/starter-packs', apiLimiter)
+app.use('/library', apiLimiter)
 app.use('/meal-plan', apiLimiter)
+app.use('/grocery', apiLimiter)
 
 // Metadata for onboarding's pack picker. Deliberately does not include the
 // recipe bodies: the client only ever sends ids back, so shipping fifteen full
@@ -82,15 +91,240 @@ app.get('/starter-packs', requireAuth, (req: Request, res: Response) => {
   res.json(packSummaries())
 })
 
+/**
+ * The shared recipe library behind Explore. Three routes: browse, read, copy.
+ *
+ * It is server-side content with no table of its own — `data/library.ts` is the
+ * whole store — so there is nothing to scope by userId here. The only per-user
+ * fact these routes know is which of the eight the caller has already copied,
+ * which is what `savedIds` carries.
+ *
+ * Authenticated like everything else, and rate-limited *before* requireAuth for
+ * the reason noted above. Explore sits behind the app's session gate anyway, so
+ * an anonymous browse route would widen the surface for no one's benefit.
+ */
+app.get('/library', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Which of the eight are already in this book. The Explore list marks them
+    // rather than hiding them: a recipe you have kept is the one you are most
+    // likely to be looking for, and a browse surface that removes things as you
+    // use it gets emptier the longer you use it.
+    const copied = await prisma.recipe.findMany({
+      where: { userId: req.userId, libraryId: { not: null } },
+      select: { libraryId: true },
+    })
+    res.json({
+      recipes: librarySummaries(),
+      savedIds: copied.map((r) => r.libraryId as string),
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * Copies the **whole** library in one request — onboarding's "Begin with eight
+ * classics" (SCREENS.md § 5).
+ *
+ * Batched into three statements like `/recipes/import`, and for the same reason:
+ * the obvious nested-`create`-per-recipe shape is ~24 round-trips here and the
+ * starter-pack version of it reliably overran Prisma's 5s transaction timeout
+ * against a hosted database.
+ *
+ * Skips what the account already holds — by `libraryId` for anything copied
+ * before, and by folded title for anything the user wrote themselves under the
+ * same name. Returning `{ imported, skipped }` rather than 409-ing on the first
+ * collision is deliberate: re-running this is an ordinary path (quit halfway
+ * through onboarding, come back), not an edge case.
+ *
+ * It is mounted above `/library/:id` because Express matches in order and
+ * `import` would otherwise be read as an id.
+ */
+app.post('/library/import', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const owned = await prisma.recipe.findMany({
+      where: { userId: req.userId },
+      select: { title: true, libraryId: true },
+    })
+    const takenIds = new Set(owned.map((r) => r.libraryId).filter(Boolean))
+    const takenTitles = new Set(owned.map((r) => foldForCompare(r.title)))
+
+    const fresh = LIBRARY.filter((recipe) => {
+      if (takenIds.has(recipe.id)) return false
+      return !takenTitles.has(foldForCompare(recipe.title))
+    })
+
+    if (fresh.length > 0) {
+      await prisma.$transaction(async (tx) => {
+        const created = await tx.recipe.createManyAndReturn({
+          data: fresh.map((recipe) => ({
+            title: recipe.title,
+            description: recipe.description,
+            photoUrl: recipe.photoUrl,
+            difficulty: recipe.difficulty,
+            totalMinutes: recipe.totalMinutes,
+            servings: recipe.servings,
+            cuisine: recipe.cuisine,
+            mealtime: recipe.mealtime,
+            tools: recipe.tools,
+            libraryId: recipe.id,
+            userId: req.userId as string,
+          })),
+          select: { id: true, libraryId: true },
+        })
+        // Keyed back by libraryId rather than by title. The titles are no
+        // longer language-dependent, but they are still the user's to rename
+        // the moment the copy lands, and an id is the only handle that survives
+        // that — which is the same reason the column exists at all.
+        const idByLibraryId = new Map(created.map((r) => [r.libraryId as string, r.id]))
+
+        await tx.ingredient.createMany({
+          data: fresh.flatMap((recipe) =>
+            recipe.ingredients.map(([name, quantity, unit], position) => ({
+              recipeId: idByLibraryId.get(recipe.id) as string,
+              name,
+              quantity,
+              unit,
+              position,
+            }))
+          ),
+        })
+
+        await tx.step.createMany({
+          data: fresh.flatMap((recipe) =>
+            recipe.steps.map((instruction, index) => ({
+              recipeId: idByLibraryId.get(recipe.id) as string,
+              stepNumber: index + 1,
+              instruction,
+            }))
+          ),
+        })
+      })
+    }
+
+    res.json({ imported: fresh.length, skipped: LIBRARY.length - fresh.length })
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.get(
+  '/library/:id',
+  requireAuth,
+  async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
+    // `libraryDetail`, not `libraryRecipe` — the stored ingredient tuples have
+    // to be named before they go over the wire. See the note on that function.
+    const recipe = libraryDetail(req.params.id)
+    if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
+    try {
+      // Same question as the list route, for one id. The detail screen's button
+      // reads "Copy to my book" or "In your book" off this.
+      const existing = await prisma.recipe.findFirst({
+        where: { userId: req.userId, libraryId: recipe.id },
+        select: { id: true },
+      })
+      res.json({ ...recipe, savedRecipeId: existing?.id ?? null })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * Copy one library recipe into the caller's own book.
+ *
+ * **Idempotent on `libraryId`, not on title.** A copy becomes the user's own
+ * content the moment it lands, and the first thing they may do is rename it —
+ * so a title check would see the renamed row as a different recipe and hand out
+ * a second copy. `Recipe.libraryId` plus its `@@unique([userId, libraryId])` is
+ * what makes the second tap a no-op. (It was introduced for a sharper version
+ * of the same problem: the library used to ship in two languages and a copy
+ * stored whichever one you were reading, so the title moved under the check.)
+ *
+ * Copying an already-copied recipe returns 200 with the existing row rather
+ * than 409. Tapping it twice is an ordinary thing to do from a list that shows
+ * you what you already have, and the honest answer to "put this in my book" is
+ * that it is in your book. Same reading as the import route's skip.
+ */
+app.post(
+  '/library/:id/copy',
+  requireAuth,
+  async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
+    const recipe = libraryRecipe(req.params.id)
+    if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
+
+    // One language, so there is nothing to choose and the request carries no
+    // body. `data/library.ts` is Khmer throughout — see the note at its top.
+    const { title, description } = recipe
+
+    try {
+      const existing = await prisma.recipe.findFirst({
+        where: { userId: req.userId, libraryId: recipe.id },
+        include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
+      })
+      if (existing) return res.json(existing)
+
+      // A user who wrote their own "Kroeung" before ever opening Explore still
+      // owns that title, and the per-user title rule is what the editor enforces
+      // on their next save. Refusing here with the same 409 POST /recipes uses
+      // keeps one rule rather than two, and names the row they already have.
+      const wanted = foldForCompare(title)
+      const titles = await prisma.recipe.findMany({
+        where: { userId: req.userId },
+        select: { id: true, title: true },
+      })
+      const clash = titles.find((r) => foldForCompare(r.title) === wanted)
+      if (clash) {
+        return res.status(409).json({ error: `You already have a recipe titled "${clash.title}"` })
+      }
+
+      const created = await prisma.recipe.create({
+        data: {
+          title,
+          description,
+          photoUrl: recipe.photoUrl,
+          difficulty: recipe.difficulty,
+          totalMinutes: recipe.totalMinutes,
+          servings: recipe.servings,
+          cuisine: recipe.cuisine,
+          mealtime: recipe.mealtime,
+          tools: recipe.tools,
+          libraryId: recipe.id,
+          userId: req.userId as string,
+          ingredients: {
+            create: recipe.ingredients.map(([name, quantity, unit], position) => ({
+              name,
+              quantity,
+              unit,
+              position,
+            })),
+          },
+          steps: {
+            create: recipe.steps.map((instruction, index) => ({
+              stepNumber: index + 1,
+              instruction,
+            })),
+          },
+        },
+        include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
+      })
+      res.status(201).json(created)
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
 app.get('/recipes', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const recipes = await prisma.recipe.findMany({
       where: { userId: req.userId },
       include: {
-        ingredients: true,
         // Postgres gives no row order without ORDER BY, and PUT deletes and
-        // recreates these rows on every save — so ordering can't be left to
-        // whatever the heap happens to return.
+        // recreates both of these on every save — so ordering can't be left to
+        // whatever the heap happens to return. Ingredients carried exactly that
+        // bug until `position` existed.
+        ingredients: { orderBy: { position: 'asc' } },
         steps: { orderBy: { stepNumber: 'asc' } },
       },
       orderBy: { createdAt: 'desc' },
@@ -105,7 +339,7 @@ app.get('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
   try {
     const recipe = await prisma.recipe.findUnique({
       where: { id: req.params.id },
-      include: { ingredients: true, steps: { orderBy: { stepNumber: 'asc' } } },
+      include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
     })
     // Same 404 whether it doesn't exist or isn't yours — a distinct 403 would
     // confirm the id is real.
@@ -151,10 +385,13 @@ app.post('/recipes', requireAuth, async (req: Request, res: Response, next: Next
       data: {
         ...recipe,
         userId: req.userId as string,
-        ingredients: { create: ingredients },
+        // `position` comes from the array index, never from the request: the
+        // client's job is to send its list in the order it shows it, and
+        // anything more than that is a number a client could get wrong.
+        ingredients: { create: ingredients.map((i, position) => ({ ...i, position })) },
         steps: { create: steps },
       },
-      include: { ingredients: true, steps: { orderBy: { stepNumber: 'asc' } } },
+      include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
     })
     res.status(201).json(newRecipe)
   } catch (err) {
@@ -192,10 +429,16 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
       where: { id: req.params.id, userId: req.userId },
       data: {
         ...recipe,
-        ingredients: { deleteMany: {}, create: ingredients },
+        // Reindexed from the array, like POST — a reordered list arrives as a
+        // whole list in its new order, so the positions are simply rewritten
+        // along with the rows.
+        ingredients: {
+          deleteMany: {},
+          create: ingredients.map((i, position) => ({ ...i, position })),
+        },
         steps: { deleteMany: {}, create: steps },
       },
-      include: { ingredients: true, steps: { orderBy: { stepNumber: 'asc' } } },
+      include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
     })
 
     res.json(updatedRecipe)
@@ -228,7 +471,7 @@ app.patch('/recipes/:id/favourite', requireAuth, async (req: Request<{ id: strin
     const updatedRecipe = await prisma.recipe.update({
       where: { id: req.params.id, userId: req.userId },
       data: { isFavourite: parsed.data.isFavourite },
-      include: { ingredients: true, steps: { orderBy: { stepNumber: 'asc' } } },
+      include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
     })
     res.json(updatedRecipe)
   } catch (err) {
@@ -289,11 +532,12 @@ app.post('/recipes/import', requireAuth, async (req: Request, res: Response, nex
 
         await tx.ingredient.createMany({
           data: fresh.flatMap((recipe) =>
-            recipe.ingredients.map(([name, quantity, unit]) => ({
+            recipe.ingredients.map(([name, quantity, unit], position) => ({
               recipeId: idByTitle.get(recipe.title) as string,
               name,
               quantity,
               unit,
+              position,
             }))
           ),
         })
@@ -454,6 +698,247 @@ app.delete(
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
         return res.status(404).json({ error: 'Nothing planned in that slot' })
       }
+      next(err)
+    }
+  }
+)
+
+// ─── Grocery ───────────────────────────────────────────────────────────────
+//
+// The list is derived from the week's plan on every read and never stored, so
+// there is no POST for a line and no "rebuild": change a dinner and the next
+// GET reflects it. The two tables behind these routes hold only what derivation
+// cannot know — the ticks, the hand-typed amount corrections, and the manual
+// additions.
+//
+// `from` is the week start. The client always asks for a Monday-to-Sunday week
+// and narrows to "Today" or "Missing only" on its own side, so the whole screen
+// is one request and every line's state row can be addressed by that one date.
+// Accepting an arbitrary range here instead would leave the server unable to
+// say which week a tick belonged to.
+
+app.get('/grocery', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = groceryRangeSchema.safeParse(req.query)
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error))
+  }
+  const { from, to } = parsed.data
+  const weekStart = toDateOnly(from)
+
+  try {
+    // One row per planned meal, each carrying its recipe's ingredients. This
+    // deliberately does NOT de-duplicate recipes: the same dinner planned twice
+    // in a week has to be bought for twice.
+    const [slots, lines, manual] = await Promise.all([
+      prisma.mealPlan.findMany({
+        where: { userId: req.userId, date: { gte: weekStart, lte: toDateOnly(to) } },
+        // Ordered so `dishes` below comes out in the order the week is cooked
+        // in rather than in whatever order Postgres felt like returning.
+        orderBy: { date: 'asc' },
+        select: {
+          // The date and the recipe both travel with the ingredients so a line
+          // can be split back into the meals that made it — see `LinePart`,
+          // which is what the app's "Today" scope and its dish filter narrow by.
+          date: true,
+          recipe: {
+            select: {
+              id: true,
+              title: true,
+              photoUrl: true,
+              // Ordered for the same reason the recipe reads are, even though
+              // the sum doesn't care: two identical requests should produce
+              // identical payloads, and `byDate` is assembled by walking these.
+              ingredients: {
+                select: { name: true, quantity: true, unit: true },
+                orderBy: { position: 'asc' },
+              },
+            },
+          },
+        },
+      }),
+      prisma.groceryLine.findMany({
+        where: { userId: req.userId, weekStart },
+        select: { key: true, ticked: true, amountOverride: true },
+      }),
+      prisma.groceryItem.findMany({
+        where: { userId: req.userId, weekStart },
+        select: { id: true, name: true, amount: true, unit: true, ticked: true },
+        orderBy: { createdAt: 'asc' },
+      }),
+    ])
+
+    const state = new Map(lines.map((line) => [line.key, line]))
+    const derived = aggregateIngredients(
+      slots.flatMap((slot) =>
+        slot.recipe.ingredients.map((ingredient) => ({
+          ...ingredient,
+          date: fromDateOnly(slot.date),
+          recipeId: slot.recipe.id,
+        }))
+      )
+    )
+
+    /**
+     * The distinct dishes this list was derived from, so the app can offer them
+     * as filters without a second request and without holding the week's plan
+     * itself.
+     *
+     * **De-duplicated here and only here.** The aggregation above walks slots —
+     * the same dinner planned twice has to be bought for twice — but a dish
+     * planned twice is still one chip to press.
+     *
+     * First-planned order, which is the order the week reads in. Deliberately
+     * not alphabetical and not by how many lines each contributes: the row is a
+     * picture of the week, and a chip that moved when you ticked something off
+     * would be the worst kind of surprise in a shop.
+     */
+    const dishes: { id: string; title: string; photoUrl: string | null }[] = []
+    const seenDish = new Set<string>()
+    for (const slot of slots) {
+      if (seenDish.has(slot.recipe.id)) continue
+      seenDish.add(slot.recipe.id)
+      dishes.push({ id: slot.recipe.id, title: slot.recipe.title, photoUrl: slot.recipe.photoUrl })
+    }
+
+    res.json({
+      from,
+      to,
+      // Two arrays rather than one tagged list: the client groups the derived
+      // lines by aisle and pins the manual ones to their own "Added by you"
+      // section, so it never has to filter one list back into two.
+      lines: derived.map((line) => {
+        const stored = state.get(line.key)
+        return {
+          key: line.key,
+          name: line.name,
+          unit: line.unit,
+          planAmount: roundAmount(line.planAmount),
+          // What to render. An override is a correction the user typed and it
+          // wins; `planAmount` travels beside it so the client can offer to
+          // reset, and so the two can be told apart at all.
+          amount: roundAmount(stored?.amountOverride ?? line.planAmount),
+          amountOverride: stored?.amountOverride ?? null,
+          ticked: stored?.ticked ?? false,
+          // Rounded the same way `amount` is: these are sums of the same
+          // floats, so they drift the same way, and one of them is displayed
+          // whenever the app is narrowed to a day or to a dish.
+          parts: line.parts.map((part) => ({ ...part, amount: roundAmount(part.amount) })),
+        }
+      }),
+      items: manual,
+      dishes,
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// An idempotent upsert to a known address, exactly as a meal-plan slot is —
+// which is why this is a PUT with no POST beside it. A line exists conceptually
+// whether or not you have ever ticked it.
+app.put('/grocery/line', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = groceryLineSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error))
+  }
+  const { weekStart, key, ticked, amountOverride } = parsed.data
+
+  try {
+    const line = await prisma.groceryLine.upsert({
+      where: {
+        userId_weekStart_key: { userId: req.userId!, weekStart: toDateOnly(weekStart), key },
+      },
+      // `undefined` tells Prisma to leave a column alone and `null` clears it,
+      // which is exactly the distinction `.nullable().optional()` preserves in
+      // the schema — sending only `ticked` must not wipe a correction the user
+      // typed a moment earlier.
+      update: { ticked, amountOverride },
+      create: {
+        userId: req.userId!,
+        weekStart: toDateOnly(weekStart),
+        key,
+        ticked: ticked ?? false,
+        amountOverride: amountOverride ?? null,
+      },
+      select: { key: true, ticked: true, amountOverride: true },
+    })
+    res.json(line)
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.post('/grocery/items', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = groceryItemSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error))
+  }
+  const { weekStart, name, amount, unit } = parsed.data
+
+  try {
+    const existing = await prisma.groceryItem.count({
+      where: { userId: req.userId, weekStart: toDateOnly(weekStart) },
+    })
+    if (existing >= MAX_GROCERY_ITEMS_PER_WEEK) {
+      return res
+        .status(400)
+        .json({ error: `A week can hold ${MAX_GROCERY_ITEMS_PER_WEEK} added items` })
+    }
+    const item = await prisma.groceryItem.create({
+      data: { userId: req.userId!, weekStart: toDateOnly(weekStart), name, amount, unit },
+      select: { id: true, name: true, amount: true, unit: true, ticked: true },
+    })
+    res.status(201).json(item)
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.patch(
+  '/grocery/items/:id',
+  requireAuth,
+  async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
+    const parsed = groceryItemPatchSchema.safeParse(req.body)
+    if (!parsed.success) {
+      return res.status(400).json(formatZodError(parsed.error))
+    }
+    try {
+      // Scoped by userId in the WHERE rather than checked after the fact. There
+      // is no foreign key from this table to anything, so nothing in the
+      // database would stop a stranger's id being written — and a `updateMany`
+      // matching nothing gives the same 404 an unknown id does, where a
+      // distinct 403 would confirm the id was real.
+      const { count } = await prisma.groceryItem.updateMany({
+        where: { id: req.params.id, userId: req.userId },
+        data: parsed.data,
+      })
+      if (count === 0) {
+        return res.status(404).json({ error: 'Item not found' })
+      }
+      const item = await prisma.groceryItem.findUnique({
+        where: { id: req.params.id },
+        select: { id: true, name: true, amount: true, unit: true, ticked: true },
+      })
+      res.json(item)
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+app.delete(
+  '/grocery/items/:id',
+  requireAuth,
+  async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
+    try {
+      const { count } = await prisma.groceryItem.deleteMany({
+        where: { id: req.params.id, userId: req.userId },
+      })
+      if (count === 0) {
+        return res.status(404).json({ error: 'Item not found' })
+      }
+      res.status(204).send()
+    } catch (err) {
       next(err)
     }
   }

@@ -48,7 +48,25 @@ model Recipe {
   mealPlans     MealPlan[]
   createdAt     DateTime  @default(now())
   userId        String
+  //Set when this row was copied out of the shared library (data/library.ts),
+  //null when the user wrote it themselves. It is what makes copying idempotent:
+  //`POST /library/:id/copy` skips on this rather than on the title, so someone
+  //who copies Amok in English and then switches to Khmer does not end up with
+  //two of it. Skipping by title cannot do that job, because the copy stores
+  //whichever language the user was reading in — which is the whole reason a
+  //Khmer user gets អាម៉ុកត្រី in their book rather than "Cambodian Fish Amok".
+  //
+  //starterPacks.ts documents this exact bug as the reason its fifteen recipes
+  //are never translated. This column is the fix it describes as "real work".
+  //
+  //Nullable on purpose, and Postgres treats NULLs as distinct in a unique index,
+  //so the constraint below binds only the copied rows and leaves a user free to
+  //write as many of their own as they like. The library is server-side content
+  //with no table of its own, so there is no FK to hang this off — the same
+  //arrangement as userId.
+  libraryId     String?
 
+  @@unique([userId, libraryId])
 }
 
 //One planned meal: a recipe in one mealtime slot on one day.
@@ -86,6 +104,20 @@ model Ingredient {
   name          String
   quantity      Float
   unit          String
+  //Where this ingredient sits in its recipe's list, zero-based.
+  //
+  //Deliberately has NO default: an ingredient with no position is a bug, and
+  //without one Prisma's generated types make every create site say what the
+  //order is, so a new write path can't quietly forget. Steps have carried
+  //`stepNumber` from the start; ingredients were read back in whatever order
+  //Postgres handed over, which was insertion order only because `PUT` deletes
+  //and recreates the whole list. The app can reorder both now, so the order is
+  //a stored fact rather than an accident of the storage engine.
+  //
+  //Assigned server-side from the array index, never taken from the request —
+  //the client sends its list in display order and that is the only thing it
+  //needs to be trusted about.
+  position      Int
   recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
   recipeId      String
 }
@@ -94,7 +126,69 @@ model Step {
   id            String    @id   @default(uuid())
   stepNumber    Int
   instruction   String
+  //How long this step takes, for cook mode's countdown. SECONDS, not minutes:
+  //"simmer 90 seconds" is a real instruction, and a minutes column would have to
+  //round it to 1 or 2. Stored rather than parsed out of the instruction text,
+  //because "cook for 10-12 minutes, or until the edges lift" has no single
+  //number in it and a parser would have to pick one and be wrong.
+  //
+  //Nullable, and most steps are null — a timer is something the author decides
+  //to set, not a field they are asked to fill. Cook mode draws the block only
+  //where one exists.
+  durationSeconds Int?
   recipe        Recipe    @relation(fields: [recipeId], references: [id], onDelete: Cascade)
   recipeId      String
+}
+
+//The grocery list is DERIVED, not stored.
+//
+//`GET /grocery` reads the week's meal-plan slots, walks their recipes'
+//ingredients and sums them — so the list is always a true picture of the plan
+//and can never go stale when a dinner changes. Nothing here stores a line.
+//
+//What these two tables hold is only what the derivation cannot know: which
+//lines you have ticked, which amounts you have corrected by hand, and the
+//things you added yourself that no recipe asked for.
+//
+//`weekStart` is a `DATE` for exactly the reason `MealPlan.date` is — a shopping
+//week is a calendar fact, not an instant, and a timestamp would move the row
+//for a user who travelled. Always the Monday, always local to the client that
+//wrote it, always a plain YYYY-MM-DD across the wire.
+model GroceryLine {
+  id             String    @id   @default(uuid())
+  userId         String
+  weekStart      DateTime  @db.Date
+  //Folded ingredient name + unit — `foldForCompare(name)|foldForCompare(unit)`.
+  //Folded because Khmer keyboards emit zero-width spaces at word boundaries, so
+  //two visually identical names compare unequal and a tick would land on a line
+  //that redraws as a different one. The stored ingredient keeps its own
+  //spelling; only this lookup key is folded.
+  key            String
+  ticked         Boolean   @default(false)
+  //null means "use the sum from the plan". A number here is a correction the
+  //user typed, and it wins until they clear it — a plan-derived amount cannot
+  //be written back to a recipe's ingredient row without editing the recipe.
+  amountOverride Float?
+
+  //One state row per line per week: ticking is an idempotent write to a known
+  //address, exactly as a meal-plan slot is.
+  @@unique([userId, weekStart, key])
+  @@index([userId, weekStart])
+}
+
+//"Added by you" — the things no recipe asked for. Scoped to a week like the
+//lines are, because a shopping list is a week's errand and bin bags bought last
+//Tuesday should not still be on next Tuesday's list.
+model GroceryItem {
+  id            String    @id   @default(uuid())
+  userId        String
+  weekStart     DateTime  @db.Date
+  name          String
+  amount        Float
+  unit          String
+  ticked        Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+
+  @@index([userId, weekStart])
 }
 

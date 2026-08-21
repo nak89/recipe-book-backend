@@ -23,6 +23,7 @@ import {
   MALICIOUS_SVG,
 } from './harness.js'
 import { STARTER_PACKS, type StarterRecipe } from '../data/starterPacks.js'
+import { LIBRARY, libraryDetail, type LibraryRecipe } from '../data/library.js'
 import { createRecipeSchema } from '../validation.js'
 
 /**
@@ -35,6 +36,27 @@ function asApiBody(recipe: StarterRecipe) {
   const { ingredients, steps, ...rest } = recipe
   return {
     ...rest,
+    ingredients: ingredients.map(([name, quantity, unit]) => ({ name, quantity, unit })),
+    steps: steps.map((instruction, index) => ({ stepNumber: index + 1, instruction })),
+  }
+}
+
+/**
+ * The same rendering for a library recipe, minus the fields that are the
+ * library's own bookkeeping rather than a recipe's content: the id, the
+ * subject, the note and the source link. The copy route builds its Prisma input
+ * from exactly what is left.
+ */
+function asLibraryApiBody(recipe: LibraryRecipe) {
+  const { id, subject, note, source, ingredients, steps, ...rest } = recipe
+  return {
+    ...rest,
+    // `mealtime` is `.optional()` in the schema and nullable in the column, so
+    // "no mealtime" crosses the wire as an absent key rather than an explicit
+    // null — Kroeung is a paste and belongs to no meal. Note this is the exact
+    // opposite of the nutrition fields, where an explicit null is required to
+    // *clear* a value; nothing is being cleared here.
+    mealtime: rest.mealtime ?? undefined,
     ingredients: ingredients.map(([name, quantity, unit]) => ({ name, quantity, unit })),
     steps: steps.map((instruction, index) => ({ stepNumber: index + 1, instruction })),
   }
@@ -79,8 +101,16 @@ async function teardown() {
   for (const user of createdUsers) {
     // No FK from Recipe to auth.users, so deleting the user would orphan rows.
     const { count } = await prisma.recipe.deleteMany({ where: { userId: user.id } })
+    // The two grocery tables hang off `userId` alone — no relation to Recipe,
+    // so the cascade that clears meal-plan slots does not reach them and they
+    // would survive the user they belong to.
+    const lines = await prisma.groceryLine.deleteMany({ where: { userId: user.id } })
+    const items = await prisma.groceryItem.deleteMany({ where: { userId: user.id } })
     await admin.auth.admin.deleteUser(user.id)
-    console.log(`\x1b[90m  removed user ${user.email} and ${count} recipe(s)\x1b[0m`)
+    console.log(
+      `\x1b[90m  removed user ${user.email} and ${count} recipe(s), ` +
+        `${lines.count} grocery line(s), ${items.count} added item(s)\x1b[0m`
+    )
   }
   await prisma.$disconnect()
 }
@@ -307,6 +337,13 @@ async function main() {
 
   let recipeId = ''
   const title = `QA Carbonara ${randomUUID().slice(0, 6)}`
+  // The list alice's recipe is left holding, in the order she left it in.
+  // Deliberately neither alphabetical nor the order it was first written in: if
+  // a read ever falls back to sorting by name — or to whatever the heap
+  // returns, which is what it did before `Ingredient.position` — this is the
+  // list that says so. Group 6 checks it is still this, untouched, after bob
+  // has tried to overwrite the recipe.
+  const aliceIngredients = ['zaatar', 'pasta', 'mint']
 
   await test('POST /recipes creates a recipe', async () => {
     const res = await api('/recipes', { method: 'POST', token: alice.token, body: JSON.stringify(validRecipe({ title })) })
@@ -314,10 +351,22 @@ async function main() {
     recipeId = res.body.id
     expect(res.body.ingredients.length === 2, 'expected 2 ingredients')
     expect(res.body.steps.length === 2, 'expected 2 steps')
+    // Ingredients used to come back in whatever order Postgres felt like — the
+    // reads had no ORDER BY and there was no column to sort on. It looked right
+    // only because PUT deletes and recreates the whole list, so heap order and
+    // insertion order agreed. `position` makes it a stored fact; the server
+    // assigns it from the array index, so a client never sends one.
+    const names = res.body.ingredients.map((i: any) => i.name)
+    expect(names[0] === 'eggs' && names[1] === 'butter', `ingredients reordered on write: ${names}`)
+    const positions = res.body.ingredients.map((i: any) => i.position)
+    expect(
+      JSON.stringify(positions) === JSON.stringify([0, 1]),
+      `positions should be 0,1 — got ${positions}`
+    )
     return `201 id=${recipeId.slice(0, 8)}…`
   })
 
-  await test('GET /recipes/:id returns it with steps in order', async () => {
+  await test('GET /recipes/:id returns it with steps and ingredients in order', async () => {
     const res = await api(`/recipes/${recipeId}`, { token: alice.token })
     expectStatus(res, 200)
     const numbers = res.body.steps.map((s: any) => s.stepNumber)
@@ -325,7 +374,12 @@ async function main() {
       numbers.every((n: number, i: number) => i === 0 || n >= numbers[i - 1]),
       `steps came back out of order: ${numbers}`
     )
-    return `steps ${numbers.join(',')}`
+    const positions = res.body.ingredients.map((i: any) => i.position)
+    expect(
+      positions.every((n: number, i: number) => i === 0 || n > positions[i - 1]),
+      `ingredients came back out of order: ${positions}`
+    )
+    return `steps ${numbers.join(',')} · ingredients ${positions.join(',')}`
   })
 
   await test('duplicate title is rejected with 409', async () => {
@@ -390,10 +444,26 @@ async function main() {
     const res = await api(`/recipes/${recipeId}`, {
       method: 'PUT',
       token: alice.token,
-      body: JSON.stringify(validRecipe({ title, servings: 4, ingredients: [{ name: 'pasta', quantity: 400, unit: 'g' }], steps: [{ stepNumber: 1, instruction: 'Boil' }] })),
+      body: JSON.stringify(
+        validRecipe({
+          title,
+          servings: 4,
+          ingredients: aliceIngredients.map((name, i) => ({
+            name,
+            quantity: (i + 1) * 10,
+            unit: 'g',
+          })),
+          steps: [{ stepNumber: 1, instruction: 'Boil' }],
+        })
+      ),
     })
     expectStatus(res, 200, 'a recipe must not collide with itself on save')
-    return 'saved without renaming'
+    const order = res.body.ingredients.map((i: any) => i.name)
+    expect(
+      JSON.stringify(order) === JSON.stringify(aliceIngredients),
+      `a reordered list did not survive the save: ${order.join(', ')}`
+    )
+    return `saved without renaming · ${order.join(' → ')}`
   })
 
   let secondId = ''
@@ -564,6 +634,77 @@ async function main() {
     expectStatus(res, 400)
   })
 
+  // ── Step timers ───────────────────────────────────────────────────────────
+  group('5b. Step timers — what cook mode counts down')
+
+  await test('a step keeps the duration it was saved with', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: `Timed ${Date.now()}`,
+          steps: [
+            { stepNumber: 1, instruction: 'Soak the rice.', durationSeconds: 1800 },
+            { stepNumber: 2, instruction: 'Serve.' },
+          ],
+        })
+      ),
+    })
+    expectStatus(res, 201)
+    const steps = res.body.steps.sort((a: any, b: any) => a.stepNumber - b.stepNumber)
+    expect(steps[0].durationSeconds === 1800, `expected 1800, got ${steps[0].durationSeconds}`)
+    // An omitted timer is null, not 0 — a zero-second countdown and an unset
+    // one are the same thing on screen and must not be two states in the data.
+    expect(steps[1].durationSeconds === null, `expected null, got ${steps[1].durationSeconds}`)
+    return '1800s kept, the untimed step is null'
+  })
+
+  await test('an explicit null clears a timer on edit', async () => {
+    const created = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: `Cleared ${Date.now()}`,
+          steps: [{ stepNumber: 1, instruction: 'Simmer.', durationSeconds: 600 }],
+        })
+      ),
+    })
+    expectStatus(created, 201)
+
+    const res = await api(`/recipes/${created.body.id}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: created.body.title,
+          steps: [{ stepNumber: 1, instruction: 'Simmer.', durationSeconds: null }],
+        })
+      ),
+    })
+    expectStatus(res, 200)
+    expect(
+      res.body.steps[0].durationSeconds === null,
+      `the timer survived being cleared: ${res.body.steps[0].durationSeconds}`
+    )
+    return 'null clears it'
+  })
+
+  await test('a duration outside 1..43200 seconds is rejected', async () => {
+    for (const durationSeconds of [0, -60, 43_201, 90.5, '600']) {
+      const res = await api('/recipes', {
+        method: 'POST',
+        token: alice.token,
+        body: JSON.stringify(
+          validRecipe({ steps: [{ stepNumber: 1, instruction: 'Boil.', durationSeconds }] })
+        ),
+      })
+      expectStatus(res, 400)
+    }
+    return '400 on zero, negative, over twelve hours, fractional and string'
+  })
+
   // ── Cross-user isolation ──────────────────────────────────────────────────
   group('6. Cross-user isolation — bob attacking alice')
 
@@ -585,7 +726,11 @@ async function main() {
   await test("…and alice's ingredients survived that attempt", async () => {
     const res = await api(`/recipes/${recipeId}`, { token: alice.token })
     expectStatus(res, 200)
-    expect(res.body.ingredients.length === 1, `ingredients were wiped: got ${res.body.ingredients.length}, expected 1`)
+    const names = res.body.ingredients.map((i: any) => i.name)
+    expect(
+      JSON.stringify(names) === JSON.stringify(aliceIngredients),
+      `ingredients were altered by a rejected write: ${names.join(', ')}`
+    )
     expect(res.body.steps.length === 1, `steps were wiped: got ${res.body.steps.length}, expected 1`)
     expect(res.body.title === title, `title was changed to "${res.body.title}"`)
     return 'rows intact — the delete never ran'
@@ -1081,8 +1226,697 @@ async function main() {
     return 'slot removed with the recipe'
   })
 
+  // ── Grocery ───────────────────────────────────────────────────────────────
+  group('12. Grocery — derivation, ticks, overrides and scoping')
+
+  // A different fixed week from the planner group's, so the two can't see each
+  // other's rows. Monday, because `from` is the week start.
+  const GMON = '2031-04-07'
+  const GTUE = '2031-04-08'
+  const GWEEK = { from: GMON, to: '2031-04-13' }
+  const grocery = (q: { from: string; to: string }) => `/grocery?from=${q.from}&to=${q.to}`
+
+  await test('an empty week derives an empty list, not a 404', async () => {
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    expectStatus(res, 200)
+    expect(Array.isArray(res.body.lines), 'expected lines to be an array')
+    expect(res.body.lines.length === 0, `expected 0 lines, got ${res.body.lines.length}`)
+    expect(res.body.items.length === 0, `expected 0 added items, got ${res.body.items.length}`)
+  })
+
+  await test('the range is required and capped, like the planner\'s', async () => {
+    const missing = await api('/grocery', { token: alice.token })
+    expectStatus(missing, 400)
+    const backwards = await api(grocery({ from: '2031-04-13', to: GMON }), { token: alice.token })
+    expectStatus(backwards, 400)
+    const huge = await api(grocery({ from: '2030-01-01', to: '2032-01-01' }), { token: alice.token })
+    expectStatus(huge, 400)
+    return 'missing, reversed and over-366 all rejected'
+  })
+
+  let sharedRecipeId = ''
+  let otherUnitRecipeId = ''
+
+  await test('two planned meals sharing an ingredient sum into one line', async () => {
+    // Same name AND same unit in both recipes — this is the case that must add.
+    const first = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: `QA Grocery A ${randomUUID().slice(0, 6)}`,
+          ingredients: [
+            { name: 'Beef shin', quantity: 300, unit: 'g' },
+            { name: 'Lemongrass', quantity: 2, unit: 'stalks' },
+          ],
+        })
+      ),
+    })
+    expectStatus(first, 201)
+    sharedRecipeId = first.body.id
+
+    const second = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: `QA Grocery B ${randomUUID().slice(0, 6)}`,
+          ingredients: [{ name: 'Beef shin', quantity: 250, unit: 'g' }],
+        })
+      ),
+    })
+    expectStatus(second, 201)
+
+    await api(`/meal-plan/${GMON}/Dinner`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: sharedRecipeId }),
+    })
+    await api(`/meal-plan/${GTUE}/Dinner`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: second.body.id }),
+    })
+
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    expectStatus(res, 200)
+    const beef = res.body.lines.find((l: any) => l.name === 'Beef shin')
+    expect(beef !== undefined, 'no line for the shared ingredient')
+    expect(beef.planAmount === 550, `expected 550 g summed, got ${beef.planAmount}`)
+    expect(beef.unit === 'g', `unit came back as ${beef.unit}`)
+    return `550 g from two meals`
+  })
+
+  await test('the same recipe planned twice counts twice', async () => {
+    // Buying for one dinner when two are planned is the failure this pins: the
+    // aggregation must walk slots, not distinct recipes.
+    await api(`/meal-plan/${GMON}/Lunch`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: sharedRecipeId }),
+    })
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    const beef = res.body.lines.find((l: any) => l.name === 'Beef shin')
+    expect(beef.planAmount === 850, `expected 850 g (550 + a repeat of 300), got ${beef.planAmount}`)
+    return '850 g — the repeat counted'
+  })
+
+  await test('a line splits its sum back out into the meals that made it', async () => {
+    // What the app's "Today" scope and its dish filter both narrow by. A week's
+    // total can't be taken apart again once summed, so without this the chips
+    // have nothing to filter on — which is exactly what they did before the
+    // field existed.
+    //
+    // Standing plan at this point: Monday dinner + Monday lunch are the shared
+    // recipe (300 g each), Tuesday dinner is the other one (250 g).
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    const beef = res.body.lines.find((l: any) => l.name === 'Beef shin')
+    expect(Array.isArray(beef.parts), 'no parts on the line')
+    // Two meals of one dish on one day are a single part, not two: a part is
+    // addressed by (date, recipe), and the app asks it "what did this dish want
+    // on Monday", never "what did Monday's second sitting want".
+    expect(beef.parts.length === 2, `expected 2 parts, got ${beef.parts.length}`)
+
+    const monday = beef.parts.find((p: any) => p.date === GMON && p.recipeId === sharedRecipeId)
+    expect(monday !== undefined, 'no Monday part for the shared recipe')
+    expect(monday.amount === 600, `expected 600 g on Monday (two meals), got ${monday.amount}`)
+
+    const tuesday = beef.parts.find((p: any) => p.date === GTUE)
+    expect(tuesday !== undefined, 'no Tuesday part')
+    expect(tuesday.amount === 250, `expected 250 g on Tuesday, got ${tuesday.amount}`)
+    expect(tuesday.recipeId !== sharedRecipeId, 'Tuesday’s part is filed against the wrong recipe')
+
+    // Presence is the filter, so a day nothing was planned on must be absent
+    // rather than zero — a zero would put an empty row on that day's list.
+    const days = new Set(beef.parts.map((p: any) => p.date))
+    expect(days.size === 2, `only the two planned days should appear, got ${[...days].join(', ')}`)
+    // And the split has to reconcile with the total it came from.
+    const summed = beef.parts.reduce((a: number, p: any) => a + p.amount, 0)
+    expect(summed === beef.planAmount, `parts sum to ${summed}, planAmount is ${beef.planAmount}`)
+    return 'Mon 600 g + Tue 250 g = the week’s 850 g'
+  })
+
+  await test('the week’s dishes come back once each, in the order they are cooked', async () => {
+    // The dish filter's chips. The aggregation walks slots, so a repeat is
+    // bought for twice — but a dish planned twice is still one chip to press,
+    // and this is the one place that de-duplication happens.
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    expect(Array.isArray(res.body.dishes), 'no dishes on the list')
+    const ids = res.body.dishes.map((d: any) => d.id)
+    expect(
+      new Set(ids).size === ids.length,
+      `a dish planned twice appeared twice: ${ids.join(', ')}`
+    )
+    // The shared recipe holds Monday's dinner, and Monday is the first day
+    // planned, so it leads.
+    expect(ids[0] === sharedRecipeId, 'the first-planned dish is not first')
+    const shared = res.body.dishes.find((d: any) => d.id === sharedRecipeId)
+    expect(typeof shared.title === 'string' && shared.title.length > 0, 'a dish came back untitled')
+    expect('photoUrl' in shared, 'a dish came back without its photo')
+    // Every recipe a line names has to be a dish the chip row can draw.
+    const known = new Set(ids)
+    const orphan = res.body.lines
+      .flatMap((l: any) => l.parts)
+      .find((p: any) => !known.has(p.recipeId))
+    expect(orphan === undefined, `a part names a dish that isn’t in the list: ${orphan?.recipeId}`)
+    return `${ids.length} dishes, first-planned first`
+  })
+
+  await test('the same name in a different unit stays a separate line', async () => {
+    const res = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: `QA Grocery C ${randomUUID().slice(0, 6)}`,
+          // 'g' vs 'kg': free-text units have no conversion table, so summing
+          // them would be inventing one. Two rows is the honest answer.
+          ingredients: [{ name: 'Beef shin', quantity: 1, unit: 'kg' }],
+        })
+      ),
+    })
+    expectStatus(res, 201)
+    otherUnitRecipeId = res.body.id
+    await api(`/meal-plan/${GTUE}/Lunch`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: otherUnitRecipeId }),
+    })
+
+    const list = await api(grocery(GWEEK), { token: alice.token })
+    const beefLines = list.body.lines.filter((l: any) => l.name === 'Beef shin')
+    expect(beefLines.length === 2, `expected 2 beef lines (g and kg), got ${beefLines.length}`)
+    const kg = beefLines.find((l: any) => l.unit === 'kg')
+    expect(kg?.planAmount === 1, `expected 1 kg on its own line, got ${kg?.planAmount}`)
+    return 'g and kg kept apart'
+  })
+
+  await test('names differing only by a zero-width space fold into one line', async () => {
+    // The Khmer case: keyboards emit U+200B at word boundaries, so two visually
+    // identical names compare unequal and would split into two rows — stranding
+    // the tick on whichever redrew second.
+    const zwsp = await api('/recipes', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify(
+        validRecipe({
+          title: `QA Grocery ZWSP ${randomUUID().slice(0, 6)}`,
+          ingredients: [{ name: 'Beef​ shin', quantity: 100, unit: 'g' }],
+        })
+      ),
+    })
+    expectStatus(zwsp, 201)
+    await api(`/meal-plan/${GMON}/Breakfast`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ recipeId: zwsp.body.id }),
+    })
+
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    const gramLines = res.body.lines.filter((l: any) => l.unit === 'g' && l.name.includes('shin'))
+    expect(gramLines.length === 1, `zero-width space split the line into ${gramLines.length}`)
+    expect(gramLines[0].planAmount === 950, `expected 950 g, got ${gramLines[0].planAmount}`)
+    return '950 g on one folded line'
+  })
+
+  let beefKey = ''
+
+  await test('a tick persists across a refetch', async () => {
+    const before = await api(grocery(GWEEK), { token: alice.token })
+    beefKey = before.body.lines.find((l: any) => l.unit === 'g' && l.name.includes('shin')).key
+
+    const put = await api('/grocery/line', {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, key: beefKey, ticked: true }),
+    })
+    expectStatus(put, 200)
+    expect(put.body.ticked === true, 'PUT did not report the line ticked')
+
+    const after = await api(grocery(GWEEK), { token: alice.token })
+    const line = after.body.lines.find((l: any) => l.key === beefKey)
+    expect(line.ticked === true, 'the tick did not survive the refetch')
+    return 'ticked, and still ticked'
+  })
+
+  await test('an amount override wins over the plan sum, and null clears it', async () => {
+    const set = await api('/grocery/line', {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, key: beefKey, amountOverride: 1200 }),
+    })
+    expectStatus(set, 200)
+
+    const overridden = await api(grocery(GWEEK), { token: alice.token })
+    const line = overridden.body.lines.find((l: any) => l.key === beefKey)
+    expect(line.amount === 1200, `expected the override 1200, got ${line.amount}`)
+    expect(line.planAmount === 950, `planAmount should still report 950, got ${line.planAmount}`)
+    // Sending only the override must not have wiped the tick set a moment ago.
+    expect(line.ticked === true, 'a partial write cleared the tick')
+
+    const cleared = await api('/grocery/line', {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, key: beefKey, amountOverride: null }),
+    })
+    expectStatus(cleared, 200)
+    const back = await api(grocery(GWEEK), { token: alice.token })
+    const reset = back.body.lines.find((l: any) => l.key === beefKey)
+    expect(reset.amount === 950, `expected the plan sum back, got ${reset.amount}`)
+    expect(reset.amountOverride === null, 'the override did not clear')
+    return 'override applied, then cleared'
+  })
+
+  await test('a manual item is created, edited, counted and deleted', async () => {
+    const created = await api('/grocery/items', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, name: 'Bin bags', amount: 1, unit: '' }),
+    })
+    expectStatus(created, 201)
+    const itemId = created.body.id
+
+    const listed = await api(grocery(GWEEK), { token: alice.token })
+    expect(listed.body.items.length === 1, `expected 1 added item, got ${listed.body.items.length}`)
+
+    const patched = await api(`/grocery/items/${itemId}`, {
+      method: 'PATCH',
+      token: alice.token,
+      body: JSON.stringify({ ticked: true, amount: 2 }),
+    })
+    expectStatus(patched, 200)
+    expect(patched.body.ticked === true && patched.body.amount === 2, 'patch did not apply')
+
+    const removed = await api(`/grocery/items/${itemId}`, { method: 'DELETE', token: alice.token })
+    expectStatus(removed, 204)
+    const empty = await api(grocery(GWEEK), { token: alice.token })
+    expect(empty.body.items.length === 0, 'the item survived its delete')
+    return 'created, patched, deleted'
+  })
+
+  await test('bob cannot read, tick or touch alice\'s list', async () => {
+    // No FK protects these tables — the scoping is entirely in the WHERE, so
+    // this is the test that stands between a typo and a stranger's shopping.
+    const read = await api(grocery(GWEEK), { token: bob.token })
+    expectStatus(read, 200)
+    expect(read.body.lines.length === 0, `bob saw ${read.body.lines.length} of alice's lines`)
+
+    const bobItem = await api('/grocery/items', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, name: 'Alice only', amount: 1, unit: '' }),
+    })
+    expectStatus(bobItem, 201)
+
+    const steal = await api(`/grocery/items/${bobItem.body.id}`, {
+      method: 'PATCH',
+      token: bob.token,
+      body: JSON.stringify({ ticked: true }),
+    })
+    expectStatus(steal, 404)
+    const destroy = await api(`/grocery/items/${bobItem.body.id}`, {
+      method: 'DELETE',
+      token: bob.token,
+    })
+    expectStatus(destroy, 404)
+
+    // Bob ticking the same key writes his own row, not over alice's.
+    await api('/grocery/line', {
+      method: 'PUT',
+      token: bob.token,
+      body: JSON.stringify({ weekStart: GMON, key: beefKey, ticked: false }),
+    })
+    const alicesStill = await api(grocery(GWEEK), { token: alice.token })
+    const line = alicesStill.body.lines.find((l: any) => l.key === beefKey)
+    expect(line.ticked === true, "bob's write reached alice's line")
+    return '404 on both, and no cross-write'
+  })
+
+  await test('grocery routes require a token', async () => {
+    const res = await api(grocery(GWEEK))
+    expectStatus(res, 401)
+    const put = await api('/grocery/line', {
+      method: 'PUT',
+      body: JSON.stringify({ weekStart: GMON, key: 'x|y', ticked: true }),
+    })
+    expectStatus(put, 401)
+  })
+
+  await test('a line write is validated', async () => {
+    const noKey = await api('/grocery/line', {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, key: '', ticked: true }),
+    })
+    expectStatus(noKey, 400)
+    const badDate = await api('/grocery/line', {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: '2031-4-7', key: 'x|y', ticked: true }),
+    })
+    expectStatus(badDate, 400)
+    const badAmount = await api('/grocery/items', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, name: 'Nope', amount: -5, unit: 'g' }),
+    })
+    expectStatus(badAmount, 400)
+    const noName = await api('/grocery/items', {
+      method: 'POST',
+      token: alice.token,
+      body: JSON.stringify({ weekStart: GMON, name: '   ', amount: 1, unit: 'g' }),
+    })
+    expectStatus(noName, 400)
+    return 'blank key, loose date, negative amount and blank name all rejected'
+  })
+
+  await test('unplanning a meal removes its ingredients from the list', async () => {
+    // The point of deriving rather than storing: no rebuild step, no stale row.
+    await api(`/meal-plan/${GTUE}/Lunch`, { method: 'DELETE', token: alice.token })
+    const res = await api(grocery(GWEEK), { token: alice.token })
+    const kg = res.body.lines.find((l: any) => l.unit === 'kg')
+    expect(kg === undefined, 'the unplanned meal left its ingredients behind')
+    return 'kg line gone with its meal'
+  })
+
+  group('13. Shared library — browse, copy, and the language trap')
+
+  await test('every library recipe satisfies the schema a user recipe goes through', async () => {
+    // Same reasoning as the starter-pack check above: this content never passes
+    // through POST /recipes, so nothing else would ever validate it. It is what
+    // pins the squarespace host into the photoUrl allowlist and the 60KB cap at
+    // test time rather than at a user's first tap on Explore.
+    for (const recipe of LIBRARY) {
+      const parsed = createRecipeSchema.safeParse(asLibraryApiBody(recipe))
+      expect(parsed.success, `${recipe.id}: ${parsed.success ? '' : parsed.error.issues[0]?.message}`)
+    }
+    return `${LIBRARY.length} recipes validated`
+  })
+
+  await test('every library recipe is written in Khmer, body and all', async () => {
+    // The library is Khmer only — see the note at the top of `data/library.ts`.
+    // The Khmer was drafted rather than supplied and is owed a native reader,
+    // but a row that quietly kept its English is a different problem entirely,
+    // and it is the one nothing else would catch. Khmer runs U+1780–U+17FF.
+    //
+    // `subject`, `mealtime` and `difficulty` are deliberately *not* checked:
+    // they are stored English enum values the client translates through
+    // `i18n/labels.ts`, exactly as `Recipe.mealtime` is everywhere else.
+    const khmer = /[ក-៿]/
+    for (const recipe of LIBRARY) {
+      for (const [field, value] of [
+        ['title', recipe.title],
+        ['description', recipe.description],
+        ['headline', recipe.headline],
+        ['cuisine', recipe.cuisine],
+        ['note', recipe.note],
+      ] as const) {
+        expect(khmer.test(value), `${recipe.id}: ${field} is not Khmer — "${value}"`)
+      }
+      for (const [name] of recipe.ingredients) {
+        expect(khmer.test(name), `${recipe.id}: ingredient "${name}" is not Khmer`)
+      }
+      for (const tool of recipe.tools) {
+        expect(khmer.test(tool), `${recipe.id}: tool "${tool}" is not Khmer`)
+      }
+      recipe.steps.forEach((step, i) =>
+        expect(khmer.test(step), `${recipe.id}: step ${i + 1} is not Khmer`)
+      )
+    }
+    return `${LIBRARY.length} recipes, no English left`
+  })
+
+  await test('library units keep measurements Latin and count-words Khmer', async () => {
+    // The split `ingredients.km.ts` sets out and `units.km.ts` follows: `g` and
+    // `tbsp` are symbols and stay Latin — that is how Cambodian recipes write
+    // them, and the ingredient row's unit column is a fixed width that must not
+    // wrap — while anything you *count* is a Khmer word. A unit written as an
+    // English word ("cloves", "leaves") is the failure this catches: it would
+    // reach the grocery list, where `unitFor` would pluralise it into a Khmer
+    // list.
+    const measurements = new Set(['g', 'kg', 'ml', 'l', 'tsp', 'tbsp'])
+    for (const recipe of LIBRARY) {
+      for (const [name, , unit] of recipe.ingredients) {
+        if (measurements.has(unit)) continue
+        expect(
+          /[ក-៿]/.test(unit),
+          `${recipe.id}: "${name}" is counted in "${unit}", which is neither a measurement symbol nor Khmer`
+        )
+      }
+    }
+    return 'symbols Latin, count-words Khmer'
+  })
+
+  await test('library ids are unique — the copy constraint depends on it', async () => {
+    const ids = LIBRARY.map((r) => r.id)
+    expect(new Set(ids).size === ids.length, `duplicate library id: ${ids.join(', ')}`)
+    return `${ids.length} distinct ids`
+  })
+
+  await test('GET /library lists everything, with nothing saved yet', async () => {
+    const res = await api('/library', { token: alice.token })
+    expect(res.status === 200, `expected 200, got ${res.status}`)
+    expect(res.body.recipes.length === LIBRARY.length, `expected ${LIBRARY.length} recipes`)
+    expect(res.body.savedIds.length === 0, 'a fresh account should have saved nothing')
+    // The browse payload must not carry the bodies — that's the whole reason
+    // there is a separate detail route.
+    expect(res.body.recipes[0].ingredients === undefined, 'browse payload leaked ingredients')
+    expect(res.body.recipes[0].steps === undefined, 'browse payload leaked steps')
+    return `${res.body.recipes.length} summaries, no bodies`
+  })
+
+  await test('GET /library/:id returns the body, and 404s on an unknown id', async () => {
+    const res = await api('/library/fish-amok', { token: alice.token })
+    expect(res.status === 200, `expected 200, got ${res.status}`)
+    expect(res.body.ingredients.length > 0, 'detail carried no ingredients')
+    expect(res.body.savedRecipeId === null, 'nothing is saved yet')
+    const missing = await api('/library/no-such-dish', { token: alice.token })
+    expect(missing.status === 404, `expected 404, got ${missing.status}`)
+    return '200 with a body, 404 on a stranger'
+  })
+
+  await test('GET /library/:id names its ingredient tuples', async () => {
+    // `LIBRARY` stores `[name, quantity, unit]` so that eight full recipes stay
+    // readable in a source file. That is a storage shape, and serving it
+    // unmapped sent the app an array where it reads `ingredient.name` — which
+    // came back `undefined` and threw on the first one it folded. The
+    // `ingredients.length > 0` check above passed either way; this is the
+    // assertion that does not.
+    const res = await api('/library/fish-amok', { token: alice.token })
+    for (const item of res.body.ingredients) {
+      expect(
+        typeof item.name === 'string' && item.name.length > 0,
+        `an ingredient reached the wire without a name: ${JSON.stringify(item)}`
+      )
+      expect(typeof item.quantity === 'number', `${item.name}: quantity is not a number`)
+      expect(typeof item.unit === 'string', `${item.name}: unit is not a string`)
+    }
+    // The other seven are checked through the serialiser rather than over the
+    // network — the shape is what is at stake, not the route, and seven more
+    // requests would spend limiter budget group 14 is about to need.
+    for (const id of LIBRARY.map((r) => r.id)) {
+      const detail = libraryDetail(id)
+      expect(detail !== undefined, `libraryDetail lost ${id}`)
+      expect(
+        detail!.ingredients.every((i) => typeof i.name === 'string' && i.name.length > 0),
+        `${id} has an unnamed ingredient`
+      )
+    }
+    return `named ${res.body.ingredients.length} on amok, ${LIBRARY.length} recipes checked`
+  })
+
+  await test('copying stores the Khmer title and stamps libraryId', async () => {
+    // No body: the library is one language, so there is nothing to choose and
+    // `/library/:id/copy` takes nothing but its URL.
+    const res = await api('/library/fish-amok/copy', { method: 'POST', token: alice.token })
+    expect(res.status === 201, `expected 201, got ${res.status}`)
+    expect(res.body.title === 'អាម៉ុកត្រី', `stored "${res.body.title}"`)
+    expect(res.body.libraryId === 'fish-amok', 'libraryId was not stamped')
+    expect(res.body.ingredients.length === 10, `expected 10 ingredients, got ${res.body.ingredients.length}`)
+    expect(res.body.steps[0].stepNumber === 1, 'steps were not numbered from 1')
+    return `"${res.body.title}" copied`
+  })
+
+  await test('copying the same recipe again returns the same row, not a second one', async () => {
+    const res = await api('/library/fish-amok/copy', { method: 'POST', token: alice.token })
+    expect(res.status === 200, `expected 200 for a re-copy, got ${res.status}`)
+    const all = await api('/recipes', { token: alice.token })
+    const copies = all.body.filter((r: any) => r.libraryId === 'fish-amok')
+    expect(copies.length === 1, `expected 1 copy, found ${copies.length}`)
+    return 'idempotent'
+  })
+
+  await test('renaming a copy does not let a second one through', async () => {
+    // The live version of the bug `Recipe.libraryId` exists for. It used to be
+    // reached by switching language — the copy stored whichever title you were
+    // reading, so a title check saw "Cambodian Fish Amok" and អាម៉ុកត្រី as two
+    // recipes. One language closed that door and left this one open: a copy is
+    // the user's own content the moment it lands, and the first thing they may
+    // do is rename it. Only the id survives that.
+    const all = await api('/recipes', { token: alice.token })
+    const copy = all.body.find((r: any) => r.libraryId === 'fish-amok')
+    const renamed = await api(`/recipes/${copy.id}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ ...validRecipe({}), title: 'ម្ហូបល្ងាចថ្ងៃអង្គារ', photoUrl: copy.photoUrl }),
+    })
+    expect(renamed.status === 200, `rename failed: ${renamed.status}`)
+
+    const res = await api('/library/fish-amok/copy', { method: 'POST', token: alice.token })
+    expect(res.status === 200, `expected 200, got ${res.status}`)
+    const after = await api('/recipes', { token: alice.token })
+    const copies = after.body.filter((r: any) => r.libraryId === 'fish-amok')
+    expect(copies.length === 1, `the rename created ${copies.length} copies`)
+    expect(res.body.title === 'ម្ហូបល្ងាចថ្ងៃអង្គារ', 'the copy route handed back the library row, not the user\'s')
+    return 'one recipe, under the name the user gave it'
+  })
+
+  await test('a second copy stores its own Khmer title', async () => {
+    const res = await api('/library/kroeung/copy', { method: 'POST', token: alice.token })
+    expect(res.status === 201, `expected 201, got ${res.status}`)
+    expect(res.body.title === 'គ្រឿង', `stored "${res.body.title}"`)
+    expect(/[ក-៿]/.test(res.body.description), 'description was not Khmer')
+    expect(res.body.ingredients.every((i: any) => /[ក-៿]/.test(i.name)), 'an ingredient arrived in English')
+    expect(res.body.steps.every((s: any) => /[ក-៿]/.test(s.instruction)), 'a step arrived in English')
+    return `"${res.body.title}", body in Khmer`
+  })
+
+  await test('savedIds now reports both copies', async () => {
+    const res = await api('/library', { token: alice.token })
+    expect(res.body.savedIds.includes('fish-amok'), 'fish-amok missing from savedIds')
+    expect(res.body.savedIds.includes('kroeung'), 'kroeung missing from savedIds')
+    const detail = await api('/library/fish-amok', { token: alice.token })
+    expect(detail.body.savedRecipeId !== null, 'detail did not report the saved row')
+    return `${res.body.savedIds.length} saved`
+  })
+
+  await test('a copied recipe is still editable — the photoUrl survives a PUT', async () => {
+    // The real reason images.squarespace-cdn.com had to go in the allowlist
+    // rather than merely be trusted at copy time. Without it this PUT is a 400
+    // and the recipe is frozen the moment it lands in the book.
+    const all = await api('/recipes', { token: alice.token })
+    const copy = all.body.find((r: any) => r.libraryId === 'fish-amok')
+    const res = await api(`/recipes/${copy.id}`, {
+      method: 'PUT',
+      token: alice.token,
+      body: JSON.stringify({ ...validRecipe({}), title: 'My Amok', photoUrl: copy.photoUrl }),
+    })
+    expect(res.status === 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`)
+    expect(res.body.photoUrl === copy.photoUrl, 'the library photo was rejected on edit')
+    return 'edited, photo intact'
+  })
+
+  await test('copying refuses a title the account already wrote itself', async () => {
+    // The clash is against the library's Khmer title now, which is the only
+    // title there is. Someone who wrote their own ឡុកឡាក់សាច់គោ still owns that
+    // name, and the per-user title rule is what their next save enforces — so
+    // one rule rather than two.
+    await api('/recipes', {
+      method: 'POST',
+      token: bob.token,
+      body: JSON.stringify({ ...validRecipe({}), title: 'ឡុកឡាក់សាច់គោ' }),
+    })
+    const res = await api('/library/beef-lok-lak/copy', { method: 'POST', token: bob.token })
+    expect(res.status === 409, `expected 409, got ${res.status}`)
+    return '409, naming the existing recipe'
+  })
+
+  await test('one account’s copies are invisible to another', async () => {
+    const res = await api('/library', { token: bob.token })
+    expect(!res.body.savedIds.includes('fish-amok'), "bob can see alice's copy")
+    return 'savedIds is scoped'
+  })
+
+  await test('copy takes no body, and 404s on an unknown id', async () => {
+    // It used to take `{ language }` and 400 without one. The library is Khmer
+    // only, so there is nothing to send — and a leftover body must not become a
+    // 400 for an app that has not been updated yet.
+    for (const body of [undefined, '{}', JSON.stringify({ language: 'fr' })]) {
+      const res = await api('/library/num-e/copy', { method: 'POST', token: alice.token, body })
+      expect(
+        res.status === 201 || res.status === 200,
+        `expected a copy for body ${JSON.stringify(body)}, got ${res.status}`
+      )
+    }
+    const unknown = await api('/library/no-such-dish/copy', { method: 'POST', token: alice.token })
+    expect(unknown.status === 404, `expected 404, got ${unknown.status}`)
+    return 'body ignored, 404 on the id'
+  })
+
+  // A book of its own for the bulk import: alice has copied two of the eight by
+  // now, and "imported 8, skipped 0" is only a meaningful assertion on an empty
+  // one. Torn down with the others.
+  const carol = await makeUser('classics')
+
+  await test('importing the whole library fills an empty book in one request', async () => {
+    // Onboarding's "Begin with eight classics". A fresh account, so everything
+    // lands and nothing is skipped.
+    const res = await api('/library/import', { method: 'POST', token: carol.token })
+    expect(res.status === 200, `expected 200, got ${res.status}`)
+    expect(res.body.imported === LIBRARY.length, `imported ${res.body.imported}`)
+    expect(res.body.skipped === 0, `skipped ${res.body.skipped}`)
+
+    const all = await api('/recipes', { token: carol.token })
+    expect(all.body.length === LIBRARY.length, `book holds ${all.body.length}`)
+    // Ingredients and steps have to arrive with them — the batching writes them
+    // in two separate statements keyed back by libraryId, which is exactly the
+    // kind of thing that silently writes zero rows.
+    const amok = all.body.find((r: any) => r.libraryId === 'fish-amok')
+    expect(amok.title === 'អាម៉ុកត្រី', `imported as "${amok.title}"`)
+    expect(amok.ingredients.length === 10, `amok has ${amok.ingredients.length} ingredients`)
+    expect(amok.steps.length === 5, `amok has ${amok.steps.length} steps`)
+    // Position is assigned server-side from the array index, and the batched
+    // import writes all eight recipes' ingredients in one statement — which is
+    // exactly where an off-by-one would put row 0 of the second recipe at the
+    // end of the first.
+    expect(amok.ingredients[0].name === 'ត្រីរ៉ស់', `first ingredient is "${amok.ingredients[0].name}"`)
+    return `${res.body.imported} recipes, bodies intact`
+  })
+
+  await test('re-importing skips everything instead of duplicating it', async () => {
+    // The resume-after-quit path: force-quitting between the write and
+    // `onboardedAt` lands the user back on this screen.
+    const res = await api('/library/import', { method: 'POST', token: carol.token })
+    expect(res.status === 200, `expected 200, got ${res.status}`)
+    expect(res.body.imported === 0, `imported ${res.body.imported} on a re-run`)
+    expect(res.body.skipped === LIBRARY.length, `skipped ${res.body.skipped}`)
+
+    const all = await api('/recipes', { token: carol.token })
+    expect(all.body.length === LIBRARY.length, `book grew to ${all.body.length}`)
+    return 'zero imported, book unchanged'
+  })
+
+  await test('re-importing after a rename still skips, rather than doubling the book', async () => {
+    // The same trap the single copy has, at eight times the size. It used to be
+    // reachable by switching language; now it is reachable by renaming, which
+    // is something a user does to their own recipe on the first day. Skipping
+    // by title would see a stranger and hand back sixteen recipes.
+    const before = await api('/recipes', { token: carol.token })
+    const kroeung = before.body.find((r: any) => r.libraryId === 'kroeung')
+    const renamed = await api(`/recipes/${kroeung.id}`, {
+      method: 'PUT',
+      token: carol.token,
+      body: JSON.stringify({ ...validRecipe({}), title: 'គ្រឿងរបស់ខ្ញុំ', photoUrl: kroeung.photoUrl }),
+    })
+    expect(renamed.status === 200, `rename failed: ${renamed.status}`)
+
+    const res = await api('/library/import', { method: 'POST', token: carol.token })
+    expect(res.body.imported === 0, `imported ${res.body.imported} after a rename`)
+    const all = await api('/recipes', { token: carol.token })
+    expect(all.body.length === LIBRARY.length, `book grew to ${all.body.length}`)
+    return 'still eight'
+  })
+
+  await test('the library needs a token like everything else', async () => {
+    for (const path of ['/library', '/library/fish-amok']) {
+      const res = await api(path)
+      expect(res.status === 401, `${path}: expected 401, got ${res.status}`)
+    }
+    return '401 without a session'
+  })
+
   // ── Rate limiting (runs last: it deliberately exhausts the buckets) ───────
-  group('12. Rate limiting')
+  group('14. Rate limiting')
 
   await test('repeated failed logins are throttled (limit 10 / 15 min)', async () => {
     let throttledAt = 0
@@ -1109,17 +1943,49 @@ async function main() {
     return res.headers.get('ratelimit-policy') ?? res.headers.get('ratelimit') ?? ''
   })
 
+  /**
+   * **Concurrent, not sequential, and that is the fix rather than a detail.**
+   *
+   * This used to `await` 200 requests one after another. Every one of them makes
+   * a live `supabase.auth.getUser` call, so the loop ran at 250–600ms per
+   * request — 50 to 120 seconds end to end. The limiter's window is 60 seconds
+   * on a fixed reset, so a slow enough run spread those 200 requests across
+   * *three* windows, none of which reached 100, and the test then failed having
+   * proved nothing about the limiter. It was luck that it ever passed: the
+   * green line read "throttled after 159", i.e. it was already straddling a
+   * boundary and only just winning.
+   *
+   * Firing them concurrently lands them inside one window, and is a truer test
+   * besides — a burst is what the limiter exists to stop, and a request every
+   * quarter-second is not one. Batched rather than all at once so the dev server
+   * isn't asked for 150 sockets in a single tick.
+   */
   await test('the recipes API is throttled under a burst (limit 100 / min)', async () => {
+    const BATCH = 25
+    const BATCHES = 6 // 150 requests — comfortably over the 100/min limit
+    let sent = 0
     let throttledAt = 0
-    for (let i = 1; i <= 200; i++) {
-      const res = await api('/recipes', { token: alice.token })
-      if (res.status === 429) {
-        throttledAt = i
-        break
+    const started = Date.now()
+
+    for (let batch = 0; batch < BATCHES && throttledAt === 0; batch++) {
+      const responses = await Promise.all(
+        Array.from({ length: BATCH }, () => api('/recipes', { token: alice.token }))
+      )
+      for (const res of responses) {
+        sent += 1
+        if (res.status === 429 && throttledAt === 0) throttledAt = sent
       }
     }
-    expect(throttledAt > 0, 'sent 200 requests without ever being throttled')
-    return `throttled after ${throttledAt} request(s) in this burst`
+
+    const elapsed = (Date.now() - started) / 1000
+    expect(
+      throttledAt > 0,
+      `sent ${sent} requests in ${elapsed.toFixed(1)}s without ever being throttled`
+    )
+    // A burst that outran the window proves nothing even when it goes green, so
+    // say so rather than reporting a pass that isn't one.
+    expect(elapsed < 60, `the burst took ${elapsed.toFixed(1)}s, longer than the limiter's window`)
+    return `throttled after ${throttledAt} request(s), burst took ${elapsed.toFixed(1)}s`
   })
 
   await test('throttling applies before token verification (protects the Supabase call)', async () => {
