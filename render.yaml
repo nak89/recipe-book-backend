@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: recipe-book-api
+    runtime: node
+    region: singapore
+    plan: free
+    branch: meal-planner
+    autoDeployTrigger: commit
+    buildCommand: npm ci && npx prisma generate
+    startCommand: npx tsx index.ts
+    healthCheckPath: /
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_BUCKET
+        value: recipe-photos
+      - key: CORS_ORIGINS
+        value: https://recipe-book-mobile.expo.app,http://localhost:8081,http://localhost:19006
+      - key: TRUST_PROXY
+        value: "1"
