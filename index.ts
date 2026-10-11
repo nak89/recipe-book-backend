@@ -10,6 +10,8 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import authRoutes from './routes/auth.js'
 import { requireAuth } from './middleware/auth.js'
 import uploadRoutes from './routes/upload.js'
+import photoRoutes from './routes/photos.js'
+import { ownedPhotoPath } from './lib/photoPaths.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { apiLimiter, authLimiter, uploadLimiter } from './rateLimits.js'
 import {
@@ -83,6 +85,7 @@ app.use('/starter-packs', apiLimiter)
 app.use('/library', apiLimiter)
 app.use('/meal-plan', apiLimiter)
 app.use('/grocery', apiLimiter)
+app.use('/photos', apiLimiter, requireAuth, photoRoutes)
 
 // Metadata for onboarding's pack picker. Deliberately does not include the
 // recipe bodies: the client only ever sends ids back, so shipping fifteen full
@@ -362,6 +365,7 @@ app.post('/recipes', requireAuth, async (req: Request, res: Response, next: Next
   const { ingredients, steps, ...recipe } = parsed.data
 
   try {
+    ownedPhotoPath(recipe.photoUrl, req.userId!, process.env.SUPABASE_URL!, process.env.SUPABASE_STORAGE_BUCKET ?? 'recipe-photos')
     // Prisma's `mode: 'insensitive'` compares inside the database, so a JS fold
     // can't be pushed into it — and case-insensitivity alone doesn't see through
     // the invisible zero-width spaces Khmer keyboards emit at word boundaries,
@@ -407,6 +411,7 @@ app.put('/recipes/:id', requireAuth, async (req: Request<{ id: string }>, res: R
   const { ingredients, steps, ...recipe } = parsed.data
 
   try {
+    ownedPhotoPath(recipe.photoUrl, req.userId!, process.env.SUPABASE_URL!, process.env.SUPABASE_STORAGE_BUCKET ?? 'recipe-photos')
     // Same per-user title rule as POST — including the fold, see the note there —
     // minus this recipe itself, or saving an edit without touching the title
     // would collide with its own row.

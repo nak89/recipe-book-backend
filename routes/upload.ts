@@ -48,7 +48,9 @@ function sniff(buf: Buffer): Ext | null {
 
 const upload = multer({
   storage,
-  limits: { fileSize: 5 * 1024 * 1024, files: 1 }, //reject files larger than 5MB
+  // This endpoint accepts one photo and no text fields. A per-file size limit
+  // alone leaves multer free to accumulate arbitrarily many text fields.
+  limits: { fileSize: 5 * 1024 * 1024, files: 1, fields: 0, parts: 2, fieldNameSize: 100 },
   fileFilter: (_req, file, cb) => {
     // Deliberately lenient: this header is client-supplied, so it decides
     // nothing — sniff() below is the real gate. Kept loose because the app

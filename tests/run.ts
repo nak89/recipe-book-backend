@@ -813,6 +813,27 @@ async function main() {
     return `stored at ${path}`
   })
 
+  await test('private uploads can be viewed by their owner but cannot be signed or attached by another account', async () => {
+    const path = uploadedPaths[0]!
+    const source = `${process.env.SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${path}`
+    const payload = JSON.stringify({ urls: [source] })
+    const anonymous = await api('/photos/sign', { method: 'POST', body: payload })
+    expectStatus(anonymous, 401)
+    const other = await api('/photos/sign', { method: 'POST', token: bob.token, body: payload })
+    expectStatus(other, 404)
+    const owner = await api('/photos/sign', { method: 'POST', token: alice.token, body: payload })
+    expectStatus(owner, 200)
+    expect(owner.headers.get('cache-control') === 'no-store', 'signed links must not be cached by proxies')
+    const signed = await fetch(owner.body.photos[0].url)
+    expectStatus(signed, 200)
+    await signed.arrayBuffer()
+    const publicRead = await fetch(source)
+    expect(!publicRead.ok, 'bucket still permits public photo access')
+    await publicRead.arrayBuffer()
+    const attach = await api('/recipes', { method: 'POST', token: bob.token, body: JSON.stringify(validRecipe({ photoUrl: source })) })
+    expectStatus(attach, 404)
+  })
+
   await test('an SVG declared as image/svg+xml is rejected (stored-XSS vector)', async () => {
     const res = await api('/upload', {
       method: 'POST',
@@ -863,6 +884,34 @@ async function main() {
     })
     expectStatus(res, 400)
     expect(res.body?.error !== undefined, `expected JSON, got: ${res.raw.slice(0, 60)}`)
+  })
+
+  await test('multipart text fields are rejected before storage', async () => {
+    const body = form(PNG_1X1, 'x.png', 'image/png')
+    body.append('unexpected', 'not part of the upload contract')
+    const res = await api('/upload', { method: 'POST', token: alice.token, rawBody: body })
+    expectStatus(res, 400)
+    expect(typeof res.body?.error === 'string', 'expected a JSON error')
+  })
+
+  await test('multiple files are rejected before storage', async () => {
+    const body = form(PNG_1X1, 'x.png', 'image/png')
+    body.append('photo', new Blob([new Uint8Array(PNG_1X1)], { type: 'image/png' }), 'second.png')
+    const res = await api('/upload', { method: 'POST', token: alice.token, rawBody: body })
+    expectStatus(res, 400)
+  })
+
+  await test('Supabase client roles cannot read business tables directly', async () => {
+    for (const token of [undefined, alice.token]) {
+      for (const table of ['Recipe', 'Ingredient', 'Step', 'MealPlan', 'GroceryLine', 'GroceryItem', '_prisma_migrations']) {
+        const headers: Record<string, string> = { apikey: process.env.SUPABASE_PUBLISHABLE_KEY! }
+        if (token) headers.Authorization = `Bearer ${token}`
+        const res = await fetch(`${process.env.SUPABASE_URL}/rest/v1/${table}?select=id&limit=1`, { headers })
+        const body = await res.json() as { code?: string }
+        expect((res.status === 401 || res.status === 403) && body.code === '42501',
+          `${table}: expected permission denied, got ${res.status}`)
+      }
+    }
   })
 
   // ── Headers ───────────────────────────────────────────────────────────────

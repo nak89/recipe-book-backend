@@ -31,6 +31,10 @@ export const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
   skipSuccessfulRequests: true,
+  // Account creation still costs resources even when it succeeds. Only a
+  // successful login gets its allowance back; signups always count.
+  requestWasSuccessful: (req, res) =>
+    /^\/auth\/login\/?$/i.test(req.originalUrl.split('?')[0]!) && res.statusCode < 400,
 })
 
 /** Uploads are 5MB each and land in a bucket nothing ever prunes. */
