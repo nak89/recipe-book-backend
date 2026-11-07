@@ -11,6 +11,7 @@ import authRoutes from './routes/auth.js'
 import { requireAuth } from './middleware/auth.js'
 import uploadRoutes from './routes/upload.js'
 import photoRoutes from './routes/photos.js'
+import { HttpError } from './httpError.js'
 import { ownedPhotoPath } from './lib/photoPaths.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
 import { apiLimiter, authLimiter, uploadLimiter } from './rateLimits.js'
@@ -22,6 +23,7 @@ import {
   planRangeSchema,
   planSlotParamsSchema,
   planSlotSchema,
+  dinnerWeekSchema,
   groceryRangeSchema,
   groceryLineSchema,
   groceryItemSchema,
@@ -628,6 +630,51 @@ app.get('/meal-plan', requireAuth, async (req: Request, res: Response, next: Nex
   } catch (err) {
     next(err)
   }
+})
+
+// Must precede the generic date/mealtime route. Repeated identical drafts
+// are no-ops; conflicting slots roll back every inserted dinner.
+app.put('/meal-plan/week/dinners', requireAuth, async (req, res, next) => {
+  const parsed = dinnerWeekSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json(formatZodError(parsed.error))
+  const { weekStart, entries } = parsed.data
+  const from = toDateOnly(weekStart)
+  const end = new Date(from)
+  end.setUTCDate(end.getUTCDate() + 6)
+  try {
+    const saved = await prisma.$transaction(async tx => {
+      const ids = [...new Set(entries.map(entry => entry.recipeId))]
+      const owned = await tx.recipe.count({ where: { userId: req.userId, id: { in: ids } } })
+      if (owned !== ids.length) throw new HttpError(404, 'Recipe not found')
+      // Compare-and-set existing dinners; deterministic lock order prevents
+      // opposing swaps from locking the same dates in reverse order.
+      for (const entry of [...entries].sort((a, b) => a.date.localeCompare(b.date))) {
+        if (!entry.expectedRecipeId) continue
+        const changed = await tx.mealPlan.updateMany({
+          where: { userId: req.userId, date: toDateOnly(entry.date), mealtime: 'Dinner', recipeId: entry.expectedRecipeId },
+          data: { recipeId: entry.recipeId },
+        })
+        if (changed.count === 0) {
+          const current = await tx.mealPlan.findFirst({ where: { userId: req.userId, date: toDateOnly(entry.date), mealtime: 'Dinner' } })
+          if (current?.recipeId !== entry.recipeId) throw new HttpError(409, 'The week changed. Refresh the preview before applying it.')
+        }
+      }
+      await tx.mealPlan.createMany({
+        data: entries.filter(entry => !entry.expectedRecipeId).map(entry => ({ userId: req.userId!, date: toDateOnly(entry.date), mealtime: 'Dinner', recipeId: entry.recipeId })),
+        skipDuplicates: true,
+      })
+      const week = await tx.mealPlan.findMany({
+        where: { userId: req.userId, date: { gte: from, lte: end } },
+        select: { id: true, date: true, mealtime: true, recipeId: true, recipe: { select: plannerRecipeSelect } },
+        orderBy: [{ date: 'asc' }, { mealtime: 'asc' }],
+      })
+      if (entries.some(entry => !week.some(slot => slot.mealtime === 'Dinner' && fromDateOnly(slot.date) === entry.date && slot.recipeId === entry.recipeId))) {
+        throw new HttpError(409, 'The week changed. Refresh the preview before applying it.')
+      }
+      return week
+    })
+    res.json(saved.map(slot => ({ ...slot, date: fromDateOnly(slot.date) })))
+  } catch (err) { next(err) }
 })
 
 app.put(

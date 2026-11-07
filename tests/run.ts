@@ -1965,6 +1965,89 @@ async function main() {
   })
 
   // ── Rate limiting (runs last: it deliberately exhausts the buckets) ───────
+  group('13b. Atomic dinner-week drafts')
+  let dinnerA: string
+  let dinnerB: string
+  let foreignDinner: string
+  const draftWeek = '2026-11-09'
+  const dinnerBatch = (entries: { date: string; recipeId: string }[], weekStart = draftWeek) => JSON.stringify({ weekStart, entries })
+  await test('prepare dinner generation fixtures', async () => {
+    const a = await api('/recipes', { method: 'POST', token: alice.token, body: JSON.stringify(validRecipe({ title: `Dinner A ${randomUUID()}` })) })
+    const b = await api('/recipes', { method: 'POST', token: alice.token, body: JSON.stringify(validRecipe({ title: `Dinner B ${randomUUID()}` })) })
+    const foreign = await api('/recipes', { method: 'POST', token: bob.token, body: JSON.stringify(validRecipe({ title: `Foreign dinner ${randomUUID()}` })) })
+    expectStatus(a, 201); expectStatus(b, 201); expectStatus(foreign, 201)
+    dinnerA = a.body.id; dinnerB = b.body.id; foreignDinner = foreign.body.id
+  })
+  await test('dinner drafts require authentication', async () => {
+    expectStatus(await api('/meal-plan/week/dinners', { method: 'PUT', body: dinnerBatch([{ date: draftWeek, recipeId: dinnerA }]) }), 401)
+  })
+  await test('dinner draft dates are real, unique, within one Monday week and bounded', async () => {
+    for (const body of [
+      dinnerBatch([], draftWeek),
+      dinnerBatch([{ date: draftWeek, recipeId: dinnerA }], '2026-11-10'),
+      dinnerBatch([{ date: '2026-11-16', recipeId: dinnerA }]),
+      dinnerBatch([{ date: '2026-11-31', recipeId: dinnerA }]),
+      dinnerBatch([{ date: draftWeek, recipeId: dinnerA }, { date: draftWeek, recipeId: dinnerB }]),
+      dinnerBatch(Array.from({ length: 8 }, () => ({ date: draftWeek, recipeId: dinnerA }))),
+    ]) expectStatus(await api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body }), 400)
+  })
+  await test('foreign recipes reject the entire draft without partial writes', async () => {
+    const r = await api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body: dinnerBatch([{ date: draftWeek, recipeId: dinnerA }, { date: '2026-11-10', recipeId: foreignDinner }]) })
+    expectStatus(r, 404)
+    const week = await api(`/meal-plan?from=${draftWeek}&to=2026-11-15`, { token: alice.token })
+    expect(week.body.length === 0, 'foreign recipe caused partial save')
+  })
+  await test('dinner batch saves once and accepts an identical retry', async () => {
+    const body = dinnerBatch([{ date: draftWeek, recipeId: dinnerA }, { date: '2026-11-10', recipeId: dinnerB }])
+    for (let i = 0; i < 2; i++) {
+      const r = await api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body })
+      expectStatus(r, 200); expect(r.body.length === 2, 'retry duplicated slots')
+    }
+  })
+  await test('a changed slot aborts all new dinners and preserves the original', async () => {
+    const r = await api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body: dinnerBatch([{ date: draftWeek, recipeId: dinnerB }, { date: '2026-11-11', recipeId: dinnerA }]) })
+    expectStatus(r, 409)
+    const week = await api(`/meal-plan?from=${draftWeek}&to=2026-11-15`, { token: alice.token })
+    expect(week.body.length === 2, 'conflict left a partially saved draft')
+    expect(week.body.find((s: any) => s.date === draftWeek).recipeId === dinnerA, 'existing dinner overwritten')
+  })
+  await test('concurrent conflicting drafts leave a complete winning draft', async () => {
+    const weekStart = '2026-12-07'
+    const send = (recipeId: string) => api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body: dinnerBatch([{ date: weekStart, recipeId }, { date: '2026-12-08', recipeId }], weekStart) })
+    const responses = await Promise.all([send(dinnerA), send(dinnerB)])
+    expect(responses.some(r => r.status === 200) && responses.some(r => r.status === 409), 'expected one winner and one conflict')
+    const week = await api(`/meal-plan?from=${weekStart}&to=2026-12-13`, { token: alice.token })
+    expect(week.body.length === 2 && new Set(week.body.map((s: any) => s.recipeId)).size === 1, 'concurrent save produced a mixed week')
+    const other = await api(`/meal-plan?from=${weekStart}&to=2026-12-13`, { token: bob.token })
+    expect(other.body.length === 0, 'another user can read the draft')
+    const grocery = await api(`/grocery?from=${weekStart}&to=2026-12-13`, { token: alice.token })
+    expectStatus(grocery, 200); expect(grocery.body.lines.length > 0, 'groceries did not derive from batch')
+  })
+
+  await test('explicit moves swap existing dinners atomically and retry safely', async () => {
+    const body = JSON.stringify({ weekStart: draftWeek, entries: [
+      { date: draftWeek, recipeId: dinnerB, expectedRecipeId: dinnerA },
+      { date: '2026-11-10', recipeId: dinnerA, expectedRecipeId: dinnerB },
+    ] })
+    for (let i = 0; i < 2; i++) {
+      const r = await api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body })
+      expectStatus(r, 200)
+      expect(r.body.find((s: any) => s.date === draftWeek).recipeId === dinnerB, 'first day did not swap')
+      expect(r.body.find((s: any) => s.date === '2026-11-10').recipeId === dinnerA, 'second day did not swap')
+      expect(r.body.length === 2, 'swap duplicated slots')
+    }
+  })
+  await test('stale move baselines abort the entire save', async () => {
+    const body = JSON.stringify({ weekStart: draftWeek, entries: [
+      { date: '2026-11-11', recipeId: dinnerA, expectedRecipeId: null },
+      { date: draftWeek, recipeId: dinnerA, expectedRecipeId: dinnerA },
+    ] })
+    const r = await api('/meal-plan/week/dinners', { method: 'PUT', token: alice.token, body })
+    expectStatus(r, 409)
+    const week = await api(`/meal-plan?from=${draftWeek}&to=2026-11-15`, { token: alice.token })
+    expect(week.body.length === 2 && !week.body.some((s: any) => s.date === '2026-11-11'), 'stale move left a partial save')
+  })
+
   group('14. Rate limiting')
 
   await test('repeated failed logins are throttled (limit 10 / 15 min)', async () => {
@@ -2038,8 +2121,19 @@ async function main() {
   })
 
   await test('throttling applies before token verification (protects the Supabase call)', async () => {
-    const res = await api('/recipes', { token: 'garbage-token' })
-    expect(res.status === 429, `expected 429 from the limiter, got ${res.status}`)
+    // The preceding burst can finish at the reset boundary. Exhaust a fresh
+    // window with junk tokens too, rather than depending on its old bucket.
+    const started = Date.now()
+    let blocked = false
+    for (let batch = 0; batch < 6 && !blocked; batch++) {
+      const responses = await Promise.all(Array.from({ length: 25 }, () => api('/recipes', { token: 'garbage-token' })))
+      for (const res of responses) {
+        expect(res.status === 401 || res.status === 429, `unexpected junk-token status ${res.status}`)
+        if (res.status === 429) blocked = true
+      }
+    }
+    expect(Date.now() - started < 60000, 'junk-token burst exceeded the limiter window')
+    expect(blocked, 'junk tokens never reached the limiter; token verification may run first')
     return 'junk tokens are rejected by the limiter, not forwarded to Supabase'
   })
 }

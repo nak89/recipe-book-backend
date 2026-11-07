@@ -305,3 +305,20 @@ export function formatZodError(error: z.ZodError) {
   }))
   return { error: details[0]?.message ?? 'Invalid request body', details }
 }
+
+/** A dinner draft fills empty dates or conditionally replaces existing dinners in one week. */
+export const dinnerWeekSchema = z.object({
+  weekStart: dateSchema,
+  entries: z.array(z.object({ date: dateSchema, recipeId: z.uuid(), expectedRecipeId: z.uuid().nullable().optional() })).min(1).max(7),
+}).superRefine(({ weekStart, entries }, ctx) => {
+  const start = new Date(`${weekStart}T00:00:00Z`)
+  if (start.getUTCDay() !== 1) ctx.addIssue({ code: 'custom', path: ['weekStart'], message: 'Week must start on Monday' })
+  const seen = new Set<string>()
+  for (const [i, entry] of entries.entries()) {
+    const day = new Date(`${entry.date}T00:00:00Z`).getTime()
+    if (day < start.getTime() || day >= start.getTime() + 7 * 86400000 || seen.has(entry.date)) {
+      ctx.addIssue({ code: 'custom', path: ['entries', i, 'date'], message: 'Dates must be unique and within the selected week' })
+    }
+    seen.add(entry.date)
+  }
+})
