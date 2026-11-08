@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
-  <title id="title">Hearth — Recipe Book</title>
+  <title id="title">Kroueng Psom — Recipe Book</title>
   <desc id="desc">A warm cream cookbook cover with an open-book illustration and the words Discover, Keep, Cook.</desc>
   <rect width="1280" height="360" rx="20" fill="#f8f2e6"/>
   <path d="M56 48H1224M56 310H1224" stroke="#241e18" stroke-width="2"/>
   <text x="58" y="83" fill="#b4522a" font-family="monospace" font-size="14" letter-spacing="4">THE EVERYDAY COOKBOOK</text>
-  <text x="52" y="202" fill="#241e18" font-family="Georgia,serif" font-size="112" letter-spacing="-5">Hearth</text>
+  <text x="52" y="202" fill="#241e18" font-family="Georgia,serif" font-size="94" letter-spacing="-3">Kroueng Psom</text>
   <text x="59" y="258" fill="#241e18" font-family="Georgia,serif" font-size="27">A little book for everyday cooking.</text>
   <g transform="translate(865 90)" fill="none" stroke="#b4522a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
     <path d="M140 26C102 4 60 4 24 18v151c37-15 79-15 116 8 37-23 79-23 116-8V18c-36-14-78-14-116 8Z"/>

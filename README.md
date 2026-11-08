@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="docs/images/banner.svg" alt="Hearth — a little book for everyday cooking" width="100%" />
+  <img src="docs/images/banner.svg" alt="Kroueng Psom — a little book for everyday cooking" width="100%" />
 </p>
 
 <h1 align="center">Recipe Book API</h1>
 
 <p align="center">
-  The backend behind <strong>Hearth</strong>, a personal cookbook with Cambodian roots.<br />
+  The backend behind <strong>Kroueng Psom</strong>, a personal cookbook with Cambodian roots.<br />
   Recipes, weekly meal plans, and a market list built from what you’re cooking.
 </p>
 
@@ -37,7 +37,7 @@
 
 ```mermaid
 flowchart LR
-  App["Hearth · Expo app"] -->|"Sign in"| Auth["Supabase Auth"]
+  App["Kroueng Psom · Expo app"] -->|"Sign in"| Auth["Supabase Auth"]
   App -->|"Bearer access token"| API["Express API"]
   API -->|"Verify token"| Auth
   API --> Prisma["Prisma · PostgreSQL"]
