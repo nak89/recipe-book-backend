@@ -6,8 +6,8 @@ services:
     plan: free
     branch: meal-planner
     autoDeployTrigger: commit
-    buildCommand: npm ci && npx prisma generate
-    startCommand: npx tsx index.ts
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/server.js
     healthCheckPath: /
     envVars:
       - key: DATABASE_URL
