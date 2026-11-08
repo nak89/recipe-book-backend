@@ -41,15 +41,6 @@ const prisma = new PrismaClient({ adapter })
 
 const app = express()
 const PORT = Number(process.env.PORT ?? 3000)
-let receivedFirstRequest = false
-
-app.use((req, _res, next) => {
-  if (!receivedFirstRequest) {
-    receivedFirstRequest = true
-    console.info('[startup] First HTTP request', { method: req.method, path: req.path, uptimeSeconds: Math.round(process.uptime()) })
-  }
-  next()
-})
 
 // Behind a proxy/load balancer, req.ip is the proxy unless we say how many hops
 // to trust — and every client then shares one rate-limit bucket. Set
@@ -1010,7 +1001,6 @@ app.use('/upload', uploadLimiter, uploadRoutes)
 app.use(notFoundHandler)
 app.use(errorHandler)
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.info('[startup] Listening', { host: '0.0.0.0', port: PORT, uptimeSeconds: process.uptime() })
+app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`)
 })
