@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/banner.svg" alt="Kroueng Psom — a little book for everyday cooking" width="100%" />
+  <img src="docs/images/kroueng-psom-banner.svg" alt="Kroueng Psom — a little book for everyday cooking" width="100%" />
 </p>
 
 <h1 align="center">Recipe Book API</h1>
