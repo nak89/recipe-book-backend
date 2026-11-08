@@ -1,0 +1,30 @@
+name: Keep the free Render API awake
+
+on:
+  schedule:
+    # Stay below Render's 15-minute idle threshold; avoid the busy hour boundary.
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/render-keepalive.yml']
+
+# This public health check needs no repository access, checkout, or secrets.
+permissions: {}
+
+concurrency:
+  group: render-api-keepalive
+  cancel-in-progress: false
+
+jobs:
+  health:
+    if: github.repository == 'nak89/recipe-book-backend' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Request the public API health endpoint
+        run: >-
+          curl --fail --silent --show-error
+          --connect-timeout 10 --max-time 90
+          --retry 1 --retry-delay 10 --retry-max-time 190
+          https://recipe-book-api-smhg.onrender.com/
