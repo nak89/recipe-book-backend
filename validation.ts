@@ -236,6 +236,13 @@ export const planRangeSchema = z
     return days <= 366
   }, { message: 'Range must be 366 days or fewer', path: ['to'] })
 
+/** A reset covers one day or exactly a Monday–Sunday planner week. */
+export const planResetSchema = planRangeSchema.refine(({ from, to }) => {
+  if (from === to) return true
+  const monday = new Date(`${from}T00:00:00Z`)
+  return monday.getUTCDay() === 1 && Date.parse(`${to}T00:00:00Z`) - monday.getTime() === 6 * 86_400_000
+}, { message: 'Choose one day or a Monday–Sunday week', path: ['to'] })
+
 /**
  * How many manual "Added by you" items one account may hold in one week.
  *
@@ -306,19 +313,27 @@ export function formatZodError(error: z.ZodError) {
   return { error: details[0]?.message ?? 'Invalid request body', details }
 }
 
-/** A dinner draft fills empty dates or conditionally replaces existing dinners in one week. */
-export const dinnerWeekSchema = z.object({
-  weekStart: dateSchema,
-  entries: z.array(z.object({ date: dateSchema, recipeId: z.uuid(), expectedRecipeId: z.uuid().nullable().optional() })).min(1).max(7),
-}).superRefine(({ weekStart, entries }, ctx) => {
-  const start = new Date(`${weekStart}T00:00:00Z`)
-  if (start.getUTCDay() !== 1) ctx.addIssue({ code: 'custom', path: ['weekStart'], message: 'Week must start on Monday' })
-  const seen = new Set<string>()
-  for (const [i, entry] of entries.entries()) {
-    const day = new Date(`${entry.date}T00:00:00Z`).getTime()
-    if (day < start.getTime() || day >= start.getTime() + 7 * 86400000 || seen.has(entry.date)) {
-      ctx.addIssue({ code: 'custom', path: ['entries', i, 'date'], message: 'Dates must be unique and within the selected week' })
+/** Drafts address date/mealtime slots and save both meals atomically. */
+function mealWeekSchemaFor(mealtime: z.ZodType<'Breakfast' | 'Lunch' | 'Dinner'>, max: number, allowRemoval = false) {
+  return z.object({
+    weekStart: dateSchema,
+    entries: z.array(z.object({ date: dateSchema, mealtime, recipeId: allowRemoval ? z.uuid().nullable() : z.uuid(), expectedRecipeId: z.uuid().nullable().optional() })).min(1).max(max),
+  }).superRefine(({ weekStart, entries }, ctx) => {
+    const start = new Date(`${weekStart}T00:00:00Z`)
+    if (start.getUTCDay() !== 1) ctx.addIssue({ code: 'custom', path: ['weekStart'], message: 'Week must start on Monday' })
+    const seen = new Set<string>()
+    for (const [i, entry] of entries.entries()) {
+      const day = new Date(`${entry.date}T00:00:00Z`).getTime()
+      if (day < start.getTime() || day >= start.getTime() + 7 * 86400000 || seen.has(`${entry.date}:${entry.mealtime}`)) {
+        ctx.addIssue({ code: 'custom', path: ['entries', i, 'date'], message: 'Slots must be unique and within the selected week' })
+      }
+      seen.add(`${entry.date}:${entry.mealtime}`)
+      if (entry.recipeId === null && !entry.expectedRecipeId) {
+        ctx.addIssue({ code: 'custom', path: ['entries', i, 'expectedRecipeId'], message: 'Removing a meal requires its original recipe' })
+      }
     }
-    seen.add(entry.date)
-  }
-})
+  })
+}
+
+export const dinnerWeekSchema = mealWeekSchemaFor(z.literal('Dinner').default('Dinner'), 7)
+export const mealWeekSchema = mealWeekSchemaFor(z.enum(['Breakfast', 'Lunch', 'Dinner']), 21, true)

@@ -21,6 +21,12 @@ datasource db {
 //userId references a Supabase auth.users id. That table lives outside this
 //Prisma schema (Supabase Auth owns it), so there's no Prisma-level relation
 //or cascade here — just a plain scoping column.
+model ExploreCatalogue {
+  id       String @id
+  recipes  Json
+  schedule Json
+}
+
 model Recipe {
   id            String    @id   @default(uuid())
   title         String
@@ -59,11 +65,9 @@ model Recipe {
   //starterPacks.ts documents this exact bug as the reason its fifteen recipes
   //are never translated. This column is the fix it describes as "real work".
   //
-  //Nullable on purpose, and Postgres treats NULLs as distinct in a unique index,
-  //so the constraint below binds only the copied rows and leaves a user free to
-  //write as many of their own as they like. The library is server-side content
-  //with no table of its own, so there is no FK to hang this off — the same
-  //arrangement as userId.
+  //Nullable on purpose. Postgres treats NULLs as distinct in a unique index,
+  //so the constraint binds only copied rows. Personal copies do not reference
+  //a shared row, because Explore publishes its catalogue as a single snapshot.
   libraryId     String?
 
   @@unique([userId, libraryId])

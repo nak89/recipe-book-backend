@@ -24,3 +24,5 @@ services:
         value: https://recipe-book-mobile.expo.app,http://localhost:8081,http://localhost:19006
       - key: TRUST_PROXY
         value: "1"
+      - key: EXPLORE_PUBLIC_ORIGIN
+        value: https://recipe-book-api-smhg.onrender.com

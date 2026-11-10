@@ -21,9 +21,11 @@ import {
   favouriteSchema,
   importSchema,
   planRangeSchema,
+  planResetSchema,
   planSlotParamsSchema,
   planSlotSchema,
   dinnerWeekSchema,
+  mealWeekSchema,
   groceryRangeSchema,
   groceryLineSchema,
   groceryItemSchema,
@@ -32,7 +34,10 @@ import {
   formatZodError,
 } from './validation.js'
 import { packSummaries, recipesForPacks } from './data/starterPacks.js'
-import { LIBRARY, librarySummaries, libraryRecipe, libraryDetail } from './data/library.js'
+import { LIBRARY, librarySummaries, libraryRecipe, libraryDetail, type LibraryRecipe } from './data/library.js'
+import { explorePublicOrigin, localRecipePreviews, recipeImageDirectory, storeLibraryPhoto } from './data/localRecipePreviews.js'
+import { dailyExplore } from './data/exploreRotation.js'
+import localExploreSchedule from './data/exploreSchedule.json'
 import { foldForCompare } from './lib/text.js'
 import { aggregateIngredients, roundAmount } from './lib/grocery.js'
 
@@ -41,6 +46,17 @@ const prisma = new PrismaClient({ adapter })
 
 const app = express()
 const PORT = Number(process.env.PORT ?? 3000)
+const exploreRecipes = [...LIBRARY, ...localRecipePreviews]
+
+async function readExploreCatalogue() {
+  if (!explorePublicOrigin) return { recipes: exploreRecipes, schedule: localExploreSchedule }
+  const catalogue = await prisma.exploreCatalogue.findUnique({ where: { id: 'active' } })
+  if (!catalogue) throw new HttpError(503, 'Explore catalogue has not been published')
+  return {
+    recipes: catalogue.recipes as unknown as LibraryRecipe[],
+    schedule: catalogue.schedule as string[][],
+  }
+}
 
 // Behind a proxy/load balancer, req.ip is the proxy unless we say how many hops
 // to trust — and every client then shares one rate-limit bucket. Set
@@ -52,6 +68,12 @@ if (process.env.TRUST_PROXY) {
 }
 
 app.use(helmet())
+
+if (recipeImageDirectory) {
+  app.use('/local-recipe-images', express.static(recipeImageDirectory, {
+    setHeaders: (res) => res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin'),
+  }))
+}
 
 // An explicit allowlist rather than the wide-open default. Requests with no
 // Origin (the native app, curl, server-to-server) are passed through — CORS is
@@ -96,30 +118,39 @@ app.get('/starter-packs', requireAuth, (req: Request, res: Response) => {
   res.json(packSummaries())
 })
 
-/**
- * The shared recipe library behind Explore. Three routes: browse, read, copy.
- *
- * It is server-side content with no table of its own — `data/library.ts` is the
- * whole store — so there is nothing to scope by userId here. The only per-user
- * fact these routes know is which of the eight the caller has already copied,
- * which is what `savedIds` carries.
- *
- * Authenticated like everything else, and rate-limited *before* requireAuth for
- * the reason noted above. Explore sits behind the app's session gate anyway, so
- * an anonymous browse route would widen the surface for no one's benefit.
- */
+// The public catalogue exposes shared recipes only. The signed-in feed below
+// adds the caller's saved state, and copying remains a signed-in action.
+app.get('/library/catalogue', async (_req, res, next) => {
+  try {
+    const { recipes, schedule } = await readExploreCatalogue()
+    res.json({ recipes: librarySummaries(recipes), ...dailyExplore(recipes, schedule) })
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.get('/library/catalogue/:id', async (req, res, next) => {
+  try {
+    const { recipes } = await readExploreCatalogue()
+    const recipe = libraryDetail(req.params.id, recipes)
+    if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
+    res.json(recipe)
+  } catch (err) {
+    next(err)
+  }
+})
+
 app.get('/library', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    // Which of the eight are already in this book. The Explore list marks them
-    // rather than hiding them: a recipe you have kept is the one you are most
-    // likely to be looking for, and a browse surface that removes things as you
-    // use it gets emptier the longer you use it.
-    const copied = await prisma.recipe.findMany({
+    // Keep saved dishes in the daily selection and search results.
+    const [{ recipes, schedule }, copied] = await Promise.all([readExploreCatalogue(), prisma.recipe.findMany({
       where: { userId: req.userId, libraryId: { not: null } },
       select: { libraryId: true },
-    })
+    })])
+    res.setHeader('Cache-Control', 'private, no-store')
     res.json({
-      recipes: librarySummaries(),
+      recipes: librarySummaries(recipes),
+      ...dailyExplore(recipes, schedule),
       savedIds: copied.map((r) => r.libraryId as string),
     })
   } catch (err) {
@@ -128,7 +159,7 @@ app.get('/library', requireAuth, async (req: Request, res: Response, next: NextF
 })
 
 /**
- * Copies the **whole** library in one request — onboarding's "Begin with eight
+ * Copies the original starter set in one request — onboarding's "Begin with eight
  * classics" (SCREENS.md § 5).
  *
  * Batched into three statements like `/recipes/import`, and for the same reason:
@@ -219,9 +250,10 @@ app.get(
   async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
     // `libraryDetail`, not `libraryRecipe` — the stored ingredient tuples have
     // to be named before they go over the wire. See the note on that function.
-    const recipe = libraryDetail(req.params.id)
-    if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
     try {
+      const { recipes } = await readExploreCatalogue()
+      const recipe = libraryDetail(req.params.id, recipes)
+      if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
       // Same question as the list route, for one id. The detail screen's button
       // reads "Copy to my book" or "In your book" off this.
       const existing = await prisma.recipe.findFirst({
@@ -255,14 +287,13 @@ app.post(
   '/library/:id/copy',
   requireAuth,
   async (req: Request<{ id: string }>, res: Response, next: NextFunction) => {
-    const recipe = libraryRecipe(req.params.id)
-    if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
-
-    // One language, so there is nothing to choose and the request carries no
-    // body. `data/library.ts` is Khmer throughout — see the note at its top.
-    const { title, description } = recipe
+    let previewPhoto: Awaited<ReturnType<typeof storeLibraryPhoto>> | undefined
 
     try {
+      const { recipes } = await readExploreCatalogue()
+      const recipe = libraryRecipe(req.params.id, recipes)
+      if (!recipe) return res.status(404).json({ error: 'Recipe not found' })
+      const { title, description } = recipe
       const existing = await prisma.recipe.findFirst({
         where: { userId: req.userId, libraryId: recipe.id },
         include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
@@ -283,11 +314,12 @@ app.post(
         return res.status(409).json({ error: `You already have a recipe titled "${clash.title}"` })
       }
 
+      if (recipe.illustrated) previewPhoto = await storeLibraryPhoto(recipe, req.userId!)
       const created = await prisma.recipe.create({
         data: {
           title,
           description,
-          photoUrl: recipe.photoUrl,
+          photoUrl: previewPhoto?.url ?? recipe.photoUrl,
           difficulty: recipe.difficulty,
           totalMinutes: recipe.totalMinutes,
           servings: recipe.servings,
@@ -313,8 +345,10 @@ app.post(
         },
         include: { ingredients: { orderBy: { position: 'asc' } }, steps: { orderBy: { stepNumber: 'asc' } } },
       })
+      previewPhoto = undefined
       res.status(201).json(created)
     } catch (err) {
+      if (previewPhoto) await previewPhoto.remove().catch(() => undefined)
       next(err)
     }
   }
@@ -632,10 +666,24 @@ app.get('/meal-plan', requireAuth, async (req: Request, res: Response, next: Nex
   }
 })
 
+app.delete('/meal-plan', requireAuth, async (req, res, next) => {
+  const parsed = planResetSchema.safeParse(req.query)
+  if (!parsed.success) return res.status(400).json(formatZodError(parsed.error))
+  const { from, to } = parsed.data
+  try {
+    await prisma.mealPlan.deleteMany({
+      where: { userId: req.userId!, date: { gte: toDateOnly(from), lte: toDateOnly(to) } },
+    })
+    res.sendStatus(204)
+  } catch (error) {
+    next(error)
+  }
+})
+
 // Must precede the generic date/mealtime route. Repeated identical drafts
-// are no-ops; conflicting slots roll back every inserted dinner.
-app.put('/meal-plan/week/dinners', requireAuth, async (req, res, next) => {
-  const parsed = dinnerWeekSchema.safeParse(req.body)
+// are no-ops; conflicting slots roll back every change in the draft.
+app.put(['/meal-plan/week/dinners', '/meal-plan/week/meals'], requireAuth, async (req, res, next) => {
+  const parsed = (/\/dinners\/?$/i.test(req.path) ? dinnerWeekSchema : mealWeekSchema).safeParse(req.body)
   if (!parsed.success) return res.status(400).json(formatZodError(parsed.error))
   const { weekStart, entries } = parsed.data
   const from = toDateOnly(weekStart)
@@ -643,24 +691,28 @@ app.put('/meal-plan/week/dinners', requireAuth, async (req, res, next) => {
   end.setUTCDate(end.getUTCDate() + 6)
   try {
     const saved = await prisma.$transaction(async tx => {
-      const ids = [...new Set(entries.map(entry => entry.recipeId))]
+      const ids = [...new Set(entries.flatMap(entry => entry.recipeId ? [entry.recipeId] : []))]
       const owned = await tx.recipe.count({ where: { userId: req.userId, id: { in: ids } } })
       if (owned !== ids.length) throw new HttpError(404, 'Recipe not found')
-      // Compare-and-set existing dinners; deterministic lock order prevents
+      // Compare-and-set existing meals; deterministic lock order prevents
       // opposing swaps from locking the same dates in reverse order.
-      for (const entry of [...entries].sort((a, b) => a.date.localeCompare(b.date))) {
+      const ordered = [...entries].sort((a, b) => a.date.localeCompare(b.date) || a.mealtime.localeCompare(b.mealtime))
+      for (const entry of ordered) {
         if (!entry.expectedRecipeId) continue
-        const changed = await tx.mealPlan.updateMany({
-          where: { userId: req.userId, date: toDateOnly(entry.date), mealtime: 'Dinner', recipeId: entry.expectedRecipeId },
-          data: { recipeId: entry.recipeId },
-        })
+        const address = { userId: req.userId!, date: toDateOnly(entry.date), mealtime: entry.mealtime }
+        const where = { ...address, recipeId: entry.expectedRecipeId }
+        const changed = entry.recipeId === null
+          ? await tx.mealPlan.deleteMany({ where })
+          : await tx.mealPlan.updateMany({ where, data: { recipeId: entry.recipeId } })
         if (changed.count === 0) {
-          const current = await tx.mealPlan.findFirst({ where: { userId: req.userId, date: toDateOnly(entry.date), mealtime: 'Dinner' } })
-          if (current?.recipeId !== entry.recipeId) throw new HttpError(409, 'The week changed. Refresh the preview before applying it.')
+          const current = await tx.mealPlan.findFirst({ where: address })
+          if ((current?.recipeId ?? null) !== entry.recipeId) throw new HttpError(409, 'The week changed. Refresh the preview before applying it.')
         }
       }
       await tx.mealPlan.createMany({
-        data: entries.filter(entry => !entry.expectedRecipeId).map(entry => ({ userId: req.userId!, date: toDateOnly(entry.date), mealtime: 'Dinner', recipeId: entry.recipeId })),
+        data: ordered.flatMap(entry => !entry.expectedRecipeId && entry.recipeId ? [{
+          userId: req.userId!, date: toDateOnly(entry.date), mealtime: entry.mealtime, recipeId: entry.recipeId,
+        }] : []),
         skipDuplicates: true,
       })
       const week = await tx.mealPlan.findMany({
@@ -668,7 +720,7 @@ app.put('/meal-plan/week/dinners', requireAuth, async (req, res, next) => {
         select: { id: true, date: true, mealtime: true, recipeId: true, recipe: { select: plannerRecipeSelect } },
         orderBy: [{ date: 'asc' }, { mealtime: 'asc' }],
       })
-      if (entries.some(entry => !week.some(slot => slot.mealtime === 'Dinner' && fromDateOnly(slot.date) === entry.date && slot.recipeId === entry.recipeId))) {
+      if (entries.some(entry => (week.find(slot => slot.mealtime === entry.mealtime && fromDateOnly(slot.date) === entry.date)?.recipeId ?? null) !== entry.recipeId)) {
         throw new HttpError(409, 'The week changed. Refresh the preview before applying it.')
       }
       return week

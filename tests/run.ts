@@ -1725,7 +1725,12 @@ async function main() {
   await test('GET /library lists everything, with nothing saved yet', async () => {
     const res = await api('/library', { token: alice.token })
     expect(res.status === 200, `expected 200, got ${res.status}`)
-    expect(res.body.recipes.length === LIBRARY.length, `expected ${LIBRARY.length} recipes`)
+    const catalogue = await api('/library/catalogue')
+    expect(catalogue.status === 200, `public catalogue returned ${catalogue.status}`)
+    const expectedSize = process.env.EXPLORE_PUBLIC_ORIGIN || process.env.LOCAL_RECIPE_PREVIEW_ORIGIN ? 64 : LIBRARY.length
+    expect(res.body.recipes.length === expectedSize, `expected ${expectedSize} recipes`)
+    expect(catalogue.body.recipes.length === expectedSize, `expected ${expectedSize} public recipes`)
+    expect(res.body.featuredIds.length === 6, 'expected six featured dishes')
     expect(res.body.savedIds.length === 0, 'a fresh account should have saved nothing')
     // The browse payload must not carry the bodies — that's the whole reason
     // there is a separate detail route.
@@ -2024,6 +2029,32 @@ async function main() {
     expectStatus(grocery, 200); expect(grocery.body.lines.length > 0, 'groceries did not derive from batch')
   })
 
+  await test('mixed lunch/dinner drafts save fourteen slots and retry without changing breakfast', async () => {
+    const weekStart = '2027-01-04'
+    expectStatus(await api(`/meal-plan/${weekStart}/Breakfast`, { method: 'PUT', token: alice.token, body: JSON.stringify({ recipeId: dinnerA }) }), 200)
+    const entries = Array.from({ length: 7 }, (_, day) => ['Lunch', 'Dinner'].map(mealtime => ({
+      date: `2027-01-${String(4 + day).padStart(2, '0')}`, mealtime, recipeId: mealtime === 'Lunch' ? dinnerA : dinnerB,
+    }))).flat()
+    for (let i = 0; i < 2; i++) {
+      const result = await api('/meal-plan/week/meals', { method: 'PUT', token: alice.token, body: JSON.stringify({ weekStart, entries }) })
+      expectStatus(result, 200)
+      expect(result.body.length === 15, 'both meals should save once alongside breakfast')
+      expect(result.body.find((slot: any) => slot.mealtime === 'Breakfast').recipeId === dinnerA, 'breakfast changed')
+      for (const entry of entries) expect(result.body.some((slot: any) => slot.date === entry.date && slot.mealtime === entry.mealtime && slot.recipeId === entry.recipeId), 'missing meal slot')
+    }
+    const foreign = await api('/meal-plan/week/meals', { method: 'PUT', token: bob.token, body: JSON.stringify({ weekStart, entries }) })
+    expectStatus(foreign, 404)
+  })
+  await test('a conflicting dinner rolls back an earlier lunch change in a mixed draft', async () => {
+    const weekStart = '2027-01-04'
+    const result = await api('/meal-plan/week/meals', { method: 'PUT', token: alice.token, body: JSON.stringify({ weekStart, entries: [
+      { date: weekStart, mealtime: 'Lunch', recipeId: dinnerB, expectedRecipeId: dinnerA },
+      { date: weekStart, mealtime: 'Dinner', recipeId: dinnerA, expectedRecipeId: foreignDinner },
+    ] }) })
+    expectStatus(result, 409)
+    const week = await api(`/meal-plan?from=${weekStart}&to=2027-01-10`, { token: alice.token })
+    expect(week.body.find((slot: any) => slot.mealtime === 'Lunch' && slot.date === weekStart).recipeId === dinnerA, 'lunch change was not rolled back')
+  })
   await test('explicit moves swap existing dinners atomically and retry safely', async () => {
     const body = JSON.stringify({ weekStart: draftWeek, entries: [
       { date: draftWeek, recipeId: dinnerB, expectedRecipeId: dinnerA },

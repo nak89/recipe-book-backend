@@ -94,6 +94,9 @@ export const SUBJECTS = ['Soups', 'Grilled', 'Sweets', 'Festival'] as const
 export type Subject = (typeof SUBJECTS)[number]
 
 export interface LibraryRecipe {
+  /** Only present for the optional local cookbook preview. */
+  localPreview?: true
+  illustrated?: true
   /** Stable, and stored on a copied Recipe — see `Recipe.libraryId`. */
   id: string
   /** Khmer. There is no English title any more — see the note at the top. */
@@ -476,12 +479,15 @@ export const LIBRARY_IDS = LIBRARY.map((r) => r.id)
  * steps are left out: a browse response carrying eight full methods is the
  * largest thing this API would send, and the detail route is one tap away.
  */
-export function librarySummaries() {
-  return LIBRARY.map(({ ingredients, steps, note, ...rest }) => rest)
+export function librarySummaries(recipes: readonly LibraryRecipe[] = LIBRARY) {
+  return recipes.map(({ ingredients, steps, note, ...rest }) => ({
+    ...rest,
+    searchText: [rest.id.replaceAll('-', ' '), ...ingredients.map(([name]) => name)].join(' '),
+  }))
 }
 
-export function libraryRecipe(id: string): LibraryRecipe | undefined {
-  return LIBRARY.find((r) => r.id === id)
+export function libraryRecipe(id: string, recipes: readonly LibraryRecipe[] = LIBRARY): LibraryRecipe | undefined {
+  return recipes.find((r) => r.id === id)
 }
 
 /**
@@ -496,8 +502,8 @@ export function libraryRecipe(id: string): LibraryRecipe | undefined {
  * way into Prisma; this is the same unpacking for the route that only reads.
  * Nothing should serve `LIBRARY` rows unmapped.
  */
-export function libraryDetail(id: string) {
-  const recipe = libraryRecipe(id)
+export function libraryDetail(id: string, recipes: readonly LibraryRecipe[] = LIBRARY) {
+  const recipe = libraryRecipe(id, recipes)
   if (!recipe) return undefined
   const { ingredients, ...rest } = recipe
   return {
