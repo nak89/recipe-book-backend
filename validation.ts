@@ -148,6 +148,32 @@ function withSizeLimit<T extends z.ZodType>(schema: T) {
 export const createRecipeSchema = withSizeLimit(recipeBaseSchema)
 export const updateRecipeSchema = withSizeLimit(recipeBaseSchema)
 
+export const recipeDraftTextSchema = z.strictObject({
+  text: z.string().trim().min(1).max(8000),
+})
+
+// Drafts can be incomplete. Keep the bounds of the saved recipe fields and
+// use null for unknown values so missing information reaches the editor.
+export const recipeDraftSchema = withSizeLimit(z.strictObject({
+  isRecipe: z.boolean(),
+  title: recipeBaseSchema.shape.title.nullable(),
+  description: descriptionSchema.nullable(),
+  difficulty: recipeBaseSchema.shape.difficulty.nullable(),
+  totalMinutes: recipeBaseSchema.shape.totalMinutes.nullable(),
+  servings: recipeBaseSchema.shape.servings.nullable(),
+  cuisine: recipeBaseSchema.shape.cuisine.unwrap().nullable(),
+  mealtime: recipeBaseSchema.shape.mealtime.unwrap().nullable(),
+  calories: caloriesSchema.unwrap(),
+  protein: macroSchema.unwrap(),
+  carbs: macroSchema.unwrap(),
+  fat: macroSchema.unwrap(),
+  tools: recipeBaseSchema.shape.tools,
+  ingredients: z.array(ingredientSchema.extend({
+    quantity: ingredientSchema.shape.quantity.nullable(),
+  })).max(100),
+  steps: z.array(stepSchema.pick({ instruction: true })).max(100),
+}))
+
 export const favouriteSchema = z.object({
   // Must be present. `{ isFavourite: undefined }` is a no-op update that returns
   // 200, so the app's optimistic toggle would report success on a write that

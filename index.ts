@@ -5,12 +5,13 @@ import express from 'express'
 import type { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
 import helmet from 'helmet'
-import { PrismaClient, Prisma } from '@prisma/client'
-import { PrismaPg } from '@prisma/adapter-pg'
+import { Prisma } from '@prisma/client'
+import { prisma } from './lib/database.js'
 import authRoutes from './routes/auth.js'
 import { requireAuth } from './middleware/auth.js'
 import uploadRoutes from './routes/upload.js'
 import photoRoutes from './routes/photos.js'
+import recipeDraftRoutes from './routes/recipeDrafts.js'
 import { HttpError } from './httpError.js'
 import { ownedPhotoPath } from './lib/photoPaths.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
@@ -40,9 +41,6 @@ import { dailyExplore } from './data/exploreRotation.js'
 import localExploreSchedule from './data/exploreSchedule.json'
 import { foldForCompare } from './lib/text.js'
 import { aggregateIngredients, roundAmount } from './lib/grocery.js'
-
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL })
-const prisma = new PrismaClient({ adapter })
 
 const app = express()
 const PORT = Number(process.env.PORT ?? 3000)
@@ -93,7 +91,7 @@ app.use(
   })
 )
 
-app.use(express.json({ limit: '100kb' }))
+app.use(express.json({ limit: '100kb', inflate: false }))
 app.use('/auth', authLimiter, authRoutes) //using the auth routes before allowing user to hit endpoint
 
 //home endpoint
@@ -110,6 +108,7 @@ app.use('/library', apiLimiter)
 app.use('/meal-plan', apiLimiter)
 app.use('/grocery', apiLimiter)
 app.use('/photos', apiLimiter, requireAuth, photoRoutes)
+app.use('/recipe-drafts', apiLimiter, requireAuth, recipeDraftRoutes)
 
 // Metadata for onboarding's pack picker. Deliberately does not include the
 // recipe bodies: the client only ever sends ids back, so shipping fifteen full

@@ -4,6 +4,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { LIBRARY } from '../data/library.js'
 import { readIllustratedRecipes } from '../data/localRecipePreviews.js'
 import schedule from '../data/exploreSchedule.json'
+import { toolingDatabaseUrl } from './toolingDatabaseUrl.js'
 
 const origin = new URL(process.env.EXPLORE_PUBLIC_ORIGIN ?? 'http://localhost')
 if (origin.protocol !== 'https:' || origin.href !== origin.origin + '/') {
@@ -22,7 +23,7 @@ if (recipes.length !== 64 || ids.size !== 64 || schedule.length !== 31 ||
 if (process.argv.includes('--check')) {
   console.log('Validated 64 recipes, images, and 31 daily pages.')
 } else {
-  const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) })
+  const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: toolingDatabaseUrl() }) })
   const snapshot = { recipes: recipes as unknown as Prisma.InputJsonValue, schedule }
   try {
     await prisma.exploreCatalogue.upsert({

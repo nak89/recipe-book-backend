@@ -41,6 +41,9 @@ export function errorHandler(err: unknown, _req: Request, res: Response, next: N
   if (bodyParserType(err) === 'entity.too.large') {
     return res.status(413).json({ error: 'Request body is too large' })
   }
+  if (bodyParserType(err) === 'encoding.unsupported') {
+    return res.status(415).json({ error: 'Use an uncompressed JSON request body' })
+  }
 
   // Malformed JSON body — express.json() throws a SyntaxError with .status set.
   if (err instanceof SyntaxError && 'body' in err) {

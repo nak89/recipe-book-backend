@@ -4,11 +4,13 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { createClient } from '@supabase/supabase-js'
 import { ASIAN_HOUSEHOLD } from '../data/asianHousehold.js'
 import { createRecipeSchema } from '../validation.js'
+import { toolingDatabaseUrl } from './toolingDatabaseUrl.js'
 
 // Intentionally development-only, with an explicit user. Never infer a recipient.
 const DEV_REF = 'geuqlixuxutgjgsejcgt'
+const connectionString = toolingDatabaseUrl()
 if (process.env.SUPABASE_URL !== `https://${DEV_REF}.supabase.co` ||
-    decodeURIComponent(new URL(process.env.DATABASE_URL!).username) !== `postgres.${DEV_REF}`) {
+    !connectionString || decodeURIComponent(new URL(connectionString).username) !== `postgres.${DEV_REF}`) {
   throw new Error('This seed only runs against Recipe Book development.')
 }
 const userId = process.env.SEED_USER_ID
@@ -16,7 +18,7 @@ if (!userId) throw new Error('Set SEED_USER_ID to the development recipe owner.'
 const admin = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SECRET_KEY!, {
   auth: { persistSession: false, autoRefreshToken: false },
 })
-const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL }) })
+const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString }) })
 
 async function main() {
   const { data, error } = await admin.auth.admin.getUserById(userId!)

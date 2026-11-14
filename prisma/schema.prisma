@@ -27,6 +27,12 @@ model ExploreCatalogue {
   schedule Json
 }
 
+model RecipeDraftQuota {
+  key       String   @id
+  count     Int
+  expiresAt DateTime @db.Timestamptz(3)
+}
+
 model Recipe {
   id            String    @id   @default(uuid())
   title         String
