@@ -12,6 +12,7 @@ import { requireAuth } from './middleware/auth.js'
 import uploadRoutes from './routes/upload.js'
 import photoRoutes from './routes/photos.js'
 import recipeDraftRoutes from './routes/recipeDrafts.js'
+import recipeShareRoutes from './routes/recipeShares.js'
 import { HttpError } from './httpError.js'
 import { ownedPhotoPath } from './lib/photoPaths.js'
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js'
@@ -109,6 +110,7 @@ app.use('/meal-plan', apiLimiter)
 app.use('/grocery', apiLimiter)
 app.use('/photos', apiLimiter, requireAuth, photoRoutes)
 app.use('/recipe-drafts', apiLimiter, requireAuth, recipeDraftRoutes)
+app.use('/recipe-shares', recipeShareRoutes)
 
 // Metadata for onboarding's pack picker. Deliberately does not include the
 // recipe bodies: the client only ever sends ids back, so shipping fifteen full

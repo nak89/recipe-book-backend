@@ -2079,6 +2079,66 @@ async function main() {
     expect(week.body.length === 2 && !week.body.some((s: any) => s.date === '2026-11-11'), 'stale move left a partial save')
   })
 
+  group('13c. Recipe share links')
+
+  await test('only the owner can publish or revoke a recipe, and saved copies survive revocation', async () => {
+    const upload = await api('/upload', {
+      method: 'POST', token: alice.token, rawBody: form(PNG_1X1, 'share.png', 'image/png'),
+    })
+    expectStatus(upload, 200)
+    uploadedPaths.push(new URL(upload.body.url).pathname.split('/').slice(-2).join('/'))
+    const original = await api('/recipes', {
+      method: 'POST', token: alice.token, body: JSON.stringify(validRecipe({ photoUrl: upload.body.url })),
+    })
+    expectStatus(original, 201)
+    const ownerPath = `/recipe-shares/owner/${original.body.id}`
+    const publish = (token: string) => api(ownerPath, { method: 'PUT', token })
+    expectStatus(await api(ownerPath, { method: 'PUT' }), 401)
+    expectStatus(await publish(bob.token), 404)
+    expect((await api(ownerPath, { token: alice.token })).body.active === false, 'new recipe started shared')
+    const link = await publish(alice.token)
+    expectStatus(link, 200)
+    const sharePath = `/recipe-shares/${link.body.token}`
+    expectStatus(await api(`/recipe-shares/${original.body.id}`), 404)
+    const publicView = await api(sharePath)
+    expectStatus(publicView, 200)
+    expect(publicView.headers.get('cache-control')?.includes('no-store') === true, 'public response is cacheable')
+    expect(publicView.body.title === original.body.title && publicView.body.hasPrivatePhoto === true, 'shared content missing')
+    expect(!('userId' in publicView.body) && !('id' in publicView.body) && !('photoUrl' in publicView.body), 'owner data leaked')
+    const photo = await api(`${sharePath}/photo`)
+    expectStatus(photo, 200)
+    expect(photo.headers.get('content-type')?.startsWith('image/') === true, 'share photo is not an image')
+    expect(photo.headers.get('cache-control')?.includes('no-store') === true, 'share photo is cacheable')
+    expectStatus(await api(`${sharePath}/copy`, { method: 'POST' }), 401)
+    const copy = () => api(`${sharePath}/copy`, { method: 'POST', token: bob.token })
+    const copies = await Promise.all([copy(), copy()])
+    expect(copies.every(result => [200, 201].includes(result.status)) && copies[0].body.id === copies[1].body.id,
+      'concurrent saves did not return one copy')
+    const copyId = copies[0].body.id
+    const saved = await api(`/recipes/${copyId}`, { token: bob.token })
+    expectStatus(saved, 200)
+    uploadedPaths.push(new URL(saved.body.photoUrl).pathname.split('/').slice(-2).join('/'))
+    expect(saved.body.photoUrl !== original.body.photoUrl, 'copy retained the owner’s photo reference')
+
+    expectStatus(await api(ownerPath, { method: 'DELETE', token: bob.token }), 404)
+    const replacement = await publish(alice.token)
+    expectStatus(replacement, 200)
+    expectStatus(await api(sharePath), 404)
+    expectStatus(await api(`${sharePath}/photo`), 404)
+    const replacementPath = `/recipe-shares/${replacement.body.token}`
+    expectStatus(await api(replacementPath), 200)
+    expectStatus(await api(ownerPath, { method: 'DELETE', token: alice.token }), 204)
+    expectStatus(await api(replacementPath), 404)
+    expectStatus(await api(`${replacementPath}/photo`), 404)
+    expectStatus(await api(`${replacementPath}/copy`, { method: 'POST', token: bob.token }), 404)
+    expectStatus(await api(`/recipes/${copyId}`, { token: bob.token }), 200)
+
+    const lastLink = await publish(alice.token)
+    expectStatus(lastLink, 200)
+    expectStatus(await api(`/recipes/${original.body.id}`, { method: 'DELETE', token: alice.token }), 204)
+    expectStatus(await api(`/recipe-shares/${lastLink.body.token}`), 404)
+  })
+
   group('14. Rate limiting')
 
   await test('repeated failed logins are throttled (limit 10 / 15 min)', async () => {

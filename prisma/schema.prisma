@@ -75,8 +75,17 @@ model Recipe {
   //so the constraint binds only copied rows. Personal copies do not reference
   //a shared row, because Explore publishes its catalogue as a single snapshot.
   libraryId     String?
+  sharedFromId  String?
+  share         RecipeShare?
 
   @@unique([userId, libraryId])
+  @@unique([userId, sharedFromId])
+}
+
+model RecipeShare {
+  recipeId  String @id
+  tokenHash String @unique
+  recipe    Recipe @relation(fields: [recipeId], references: [id], onDelete: Cascade)
 }
 
 //One planned meal: a recipe in one mealtime slot on one day.
