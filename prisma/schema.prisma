@@ -207,6 +207,10 @@ model GroceryItem {
   unit          String
   ticked        Boolean   @default(false)
   createdAt     DateTime  @default(now())
+  shoppingDate  DateTime? @db.Date
+  // Legacy single additions have no import id and remain visible in every scope.
+  importId      String?
+  importOrder   Int?
 
   @@index([userId, weekStart])
 }

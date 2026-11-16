@@ -31,6 +31,7 @@ import {
   groceryRangeSchema,
   groceryLineSchema,
   groceryItemSchema,
+  groceryImportSchema,
   groceryItemPatchSchema,
   MAX_GROCERY_ITEMS_PER_WEEK,
   formatZodError,
@@ -822,6 +823,42 @@ app.delete(
 // Accepting an arbitrary range here instead would leave the server unable to
 // say which week a tick belonged to.
 
+const groceryItemSelect = {
+  id: true, name: true, amount: true, unit: true, ticked: true, shoppingDate: true, importId: true,
+} satisfies Prisma.GroceryItemSelect
+
+function groceryItemResponse({ shoppingDate, importId, ...item }: Prisma.GroceryItemGetPayload<{
+  select: typeof groceryItemSelect
+}>) {
+  const destination = importId === null ? 'manual' : shoppingDate === null ? 'week' : 'day'
+  return { ...item, destination, shoppingDate: shoppingDate ? fromDateOnly(shoppingDate) : null }
+}
+
+// Serialize additions for the same week's cap and let a retry see an import
+// that committed while the first request was losing its response.
+async function groceryAddition<T>(
+  userId: string,
+  weekStart: string,
+  write: (tx: Prisma.TransactionClient, address: { userId: string; weekStart: Date }) => Promise<T>,
+) {
+  return prisma.$transaction(async (tx) => {
+    const key = `grocery-add:${userId}:${weekStart}`
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))::text`
+    return write(tx, { userId, weekStart: toDateOnly(weekStart) })
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted })
+}
+
+async function checkGroceryCapacity(
+  tx: Prisma.TransactionClient,
+  address: { userId: string; weekStart: Date },
+  count: number,
+) {
+  const existing = await tx.groceryItem.count({ where: address })
+  if (existing + count > MAX_GROCERY_ITEMS_PER_WEEK) {
+    throw new HttpError(400, `A week can hold ${MAX_GROCERY_ITEMS_PER_WEEK} added items`)
+  }
+}
+
 app.get('/grocery', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   const parsed = groceryRangeSchema.safeParse(req.query)
   if (!parsed.success) {
@@ -867,8 +904,8 @@ app.get('/grocery', requireAuth, async (req: Request, res: Response, next: NextF
       }),
       prisma.groceryItem.findMany({
         where: { userId: req.userId, weekStart },
-        select: { id: true, name: true, amount: true, unit: true, ticked: true },
-        orderBy: { createdAt: 'asc' },
+        select: groceryItemSelect,
+        orderBy: [{ createdAt: 'asc' }, { importOrder: 'asc' }, { id: 'asc' }],
       }),
     ])
 
@@ -930,7 +967,7 @@ app.get('/grocery', requireAuth, async (req: Request, res: Response, next: NextF
           parts: line.parts.map((part) => ({ ...part, amount: roundAmount(part.amount) })),
         }
       }),
-      items: manual,
+      items: manual.map(groceryItemResponse),
       dishes,
     })
   } catch (err) {
@@ -978,22 +1015,41 @@ app.post('/grocery/items', requireAuth, async (req: Request, res: Response, next
   if (!parsed.success) {
     return res.status(400).json(formatZodError(parsed.error))
   }
-  const { weekStart, name, amount, unit } = parsed.data
+  const { weekStart, ...data } = parsed.data
 
   try {
-    const existing = await prisma.groceryItem.count({
-      where: { userId: req.userId, weekStart: toDateOnly(weekStart) },
+    const item = await groceryAddition(req.userId!, weekStart, async (tx, address) => {
+      await checkGroceryCapacity(tx, address, 1)
+      return tx.groceryItem.create({ data: { ...address, ...data }, select: groceryItemSelect })
     })
-    if (existing >= MAX_GROCERY_ITEMS_PER_WEEK) {
-      return res
-        .status(400)
-        .json({ error: `A week can hold ${MAX_GROCERY_ITEMS_PER_WEEK} added items` })
-    }
-    const item = await prisma.groceryItem.create({
-      data: { userId: req.userId!, weekStart: toDateOnly(weekStart), name, amount, unit },
-      select: { id: true, name: true, amount: true, unit: true, ticked: true },
+    res.status(201).json(groceryItemResponse(item))
+  } catch (err) {
+    next(err)
+  }
+})
+
+app.put('/grocery/items/import', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+  const parsed = groceryImportSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json(formatZodError(parsed.error))
+  }
+  const { weekStart, shoppingDate, importId, items } = parsed.data
+
+  try {
+    const saved = await groceryAddition(req.userId!, weekStart, async (tx, address) => {
+      const where = { ...address, importId }
+      const query = { where, select: groceryItemSelect, orderBy: { importOrder: 'asc' as const } }
+      const existing = await tx.groceryItem.findMany(query)
+      if (existing.length > 0) return existing
+
+      await checkGroceryCapacity(tx, address, items.length)
+      const date = shoppingDate ? toDateOnly(shoppingDate) : null
+      await tx.groceryItem.createMany({
+        data: items.map((item, importOrder) => ({ ...where, ...item, shoppingDate: date, importOrder })),
+      })
+      return tx.groceryItem.findMany(query)
     })
-    res.status(201).json(item)
+    res.json(saved.map(groceryItemResponse))
   } catch (err) {
     next(err)
   }
@@ -1013,18 +1069,15 @@ app.patch(
       // database would stop a stranger's id being written — and a `updateMany`
       // matching nothing gives the same 404 an unknown id does, where a
       // distinct 403 would confirm the id was real.
-      const { count } = await prisma.groceryItem.updateMany({
+      const [item] = await prisma.groceryItem.updateManyAndReturn({
         where: { id: req.params.id, userId: req.userId },
         data: parsed.data,
+        select: groceryItemSelect,
       })
-      if (count === 0) {
+      if (!item) {
         return res.status(404).json({ error: 'Item not found' })
       }
-      const item = await prisma.groceryItem.findUnique({
-        where: { id: req.params.id },
-        select: { id: true, name: true, amount: true, unit: true, ticked: true },
-      })
-      res.json(item)
+      res.json(groceryItemResponse(item))
     } catch (err) {
       next(err)
     }

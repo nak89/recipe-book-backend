@@ -22,7 +22,7 @@ export function errorHandler(err: unknown, _req: Request, res: Response, next: N
   if (res.headersSent) return next(err)
 
   if (err instanceof HttpError) {
-    return res.status(err.status).json({ error: err.message })
+    return res.status(err.status).json({ error: err.message, ...err.publicDetails })
   }
 
   if (err instanceof multer.MulterError) {

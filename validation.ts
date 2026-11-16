@@ -305,22 +305,38 @@ export const groceryLineSchema = z.object({
   amountOverride: z.number().finite().min(0).max(100_000).nullable().optional(),
 })
 
-/** A manual item. Mirrors `ingredientSchema` — it is the same kind of thing. */
-export const groceryItemSchema = z.object({
-  weekStart: dateSchema,
+const groceryItemFields = z.object({
   name: z.string().trim().min(1, 'An ingredient name is required').max(200),
   amount: z.number().finite().min(0).max(100_000),
   unit: z.string().trim().max(50),
 })
 
+/** A single manual addition. */
+export const groceryItemSchema = groceryItemFields.extend({ weekStart: dateSchema })
+
+/** All reviewed rows go to one displayed week or to a day within that week. */
+export const groceryImportSchema = z.object({
+  weekStart: dateSchema,
+  shoppingDate: dateSchema.nullable(),
+  importId: z.string().regex(/^[a-z0-9-]{16,80}$/),
+  items: z.array(groceryItemFields).min(1).max(MAX_GROCERY_ITEMS_PER_WEEK),
+}).superRefine(({ weekStart, shoppingDate }, context) => {
+  const monday = new Date(`${weekStart}T00:00:00Z`)
+  if (monday.getUTCDay() !== 1) {
+    context.addIssue({ code: 'custom', path: ['weekStart'], message: 'Week must start on Monday' })
+  }
+  if (shoppingDate) {
+    const offset = Date.parse(`${shoppingDate}T00:00:00Z`) - monday.getTime()
+    if (offset < 0 || offset >= 7 * 86_400_000) {
+      context.addIssue({ code: 'custom', path: ['shoppingDate'], message: 'Shopping date must be in the chosen week' })
+    }
+  }
+})
+
 /** A manual item edit. Every field optional, but at least one must be present. */
-export const groceryItemPatchSchema = z
-  .object({
-    name: z.string().trim().min(1, 'An ingredient name is required').max(200).optional(),
-    amount: z.number().finite().min(0).max(100_000).optional(),
-    unit: z.string().trim().max(50).optional(),
-    ticked: z.boolean().optional(),
-  })
+export const groceryItemPatchSchema = groceryItemFields
+  .extend({ ticked: z.boolean() })
+  .partial()
   .refine((value) => Object.keys(value).length > 0, { message: 'Nothing to update' })
 
 export const credentialsSchema = z.object({

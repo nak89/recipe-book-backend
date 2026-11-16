@@ -1563,6 +1563,39 @@ async function main() {
     return 'created, patched, deleted'
   })
 
+  await test('grocery paste saves a reviewed batch atomically and only once', async () => {
+    const items = [
+      { name: 'Onions', amount: 3, unit: '' },
+      { name: 'ទឹកដោះគោ', amount: 1, unit: 'លីត្រ' },
+    ]
+    const payload = {
+      importId: randomUUID(), weekStart: '2031-04-14', shoppingDate: '2031-04-15', items,
+    }
+    const send = (body: unknown) => api('/grocery/items/import', {
+      method: 'PUT', token: alice.token, body: JSON.stringify(body),
+    })
+    const week = grocery({ from: '2031-04-14', to: '2031-04-20' })
+    expectStatus(await send({ ...payload, shoppingDate: '2031-04-21' }), 400)
+    expectStatus(await send({ ...payload, items: [items[0], { ...items[1], name: '' }] }), 400)
+    const before = await api(week, { token: alice.token })
+    expect(before.body.items.length === 0, 'invalid batch partially saved')
+
+    const [first, retry] = await Promise.all([send(payload), send(payload)])
+    expectStatus(first, 200)
+    expectStatus(retry, 200)
+    expect(JSON.stringify(first.body) === JSON.stringify(retry.body), 'retry produced different rows')
+
+    const saved = await api(week, { token: alice.token })
+    expect(saved.body.items.length === items.length, 'import was duplicated or incomplete')
+    expect(
+      saved.body.items.every((item: { destination: string; shoppingDate: string }) =>
+        item.destination === 'day' && item.shoppingDate === payload.shoppingDate),
+      'imported items lost their destination',
+    )
+    const otherAccount = await api(week, { token: bob.token })
+    expect(otherAccount.body.items.length === 0, 'import leaked to another account')
+  })
+
   await test('bob cannot read, tick or touch alice\'s list', async () => {
     // No FK protects these tables — the scoping is entirely in the WHERE, so
     // this is the test that stands between a typo and a stranger's shopping.

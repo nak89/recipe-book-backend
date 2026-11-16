@@ -4,7 +4,8 @@
 export class HttpError extends Error {
   constructor(
     readonly status: number,
-    message: string
+    message: string,
+    readonly publicDetails?: { code: string; retryAt?: string },
   ) {
     super(message)
     this.name = 'HttpError'
