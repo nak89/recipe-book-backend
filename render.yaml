@@ -4,7 +4,7 @@ services:
     runtime: node
     region: singapore
     plan: free
-    branch: meal-planner
+    branch: main
     autoDeployTrigger: commit
     buildCommand: npm ci && npx prisma generate
     startCommand: npx tsx index.ts
